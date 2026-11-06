@@ -27,18 +27,32 @@ tgharbor run --config config.yaml
 
 只能在可信的交互式终端执行登录。验证码和两步验证密码会直接交给 Telethon，不会通过 Bot 发送。
 
+该命令授权的是用于处理消息链接的独立用户账号客户端，并非登录 Bot；Bot 自身使用 BotFather Token。手机号配置是可选的，因为登录命令可在本地提示输入；生成的会话会持久化到配置的 sessions 路径。
+
 ## Docker 启动
 
-无人值守服务启动前必须先创建用户会话：
+所提供的 Compose 文件允许运维者自行选择应用目录，但其绑定宿主目录的命名卷固定使用 `/data/tgharbor/data` 保存数据库和 Telegram 会话，并使用 `/data/tgharbor/downloads` 保存完成媒体。标准 Ubuntu 布局把应用放在 `/opt/TGHarbor`，并按 `.env` 中配置的 UID/GID 准备持久目录：
 
 ```bash
-docker compose build
+sudo install -d -o 1000 -g 1000 -m 0750 \
+  /opt/TGHarbor \
+  /data/tgharbor/data \
+  /data/tgharbor/downloads
+```
+
+如果 `TGHARBOR_UID:TGHARBOR_GID` 使用其他身份，请替换 `1000:1000`。无人值守服务启动前必须先创建用户会话：
+
+```bash
+cd /opt/TGHarbor
+chmod 600 .env config.yaml
+docker compose build --pull
 docker compose run --rm tgharbor login
+sudo chmod 600 /data/tgharbor/data/sessions/*.session
 docker compose up -d
 docker compose logs -f tgharbor
 ```
 
-Compose 以只读方式映射 `config.yaml`，以读写方式映射 `data/` 和 `downloads/`。数据库和两个 Telegram 会话位于 `data/` 下；重建容器不会删除它们。不要把服务扩展到多个副本：v0.1 明确使用一个应用实例锁，并在该进程内运行多个 Worker。
+Compose 以只读方式映射 `config.yaml`，并通过命名卷以读写方式挂载两个 `/data/tgharbor` 宿主来源。卷已禁用首次复制，避免第一次使用时把宿主目录所有权替换为镜像用户的 UID/GID。数据库和两个 Telegram 会话位于 `/data/tgharbor/data` 下；重建容器不会删除它们。不要把服务扩展到多个副本：v0.1 明确使用一个应用实例锁，并在该进程内运行多个 Worker。
 
 ## Bot 使用
 
@@ -65,5 +79,5 @@ docker compose stop tgharbor
 - **Unauthorized**：把发送者数字 ID 加入 `authorized_users` 或 `TGHARBOR_TELEGRAM_AUTHORIZED_USERS`，然后重启。
 - **`/data` 或 `/downloads` 权限不足**：让宿主目录对 `TGHARBOR_UID:TGHARBOR_GID` 可写。
 - **其他实例正在使用状态目录**：停止其他进程。不要通过删除锁文件绕过运行中的锁；所有权由操作系统锁而非文件内容确定。
-- **链接消息失败**：确认用户账号能打开该消息，并且消息包含可下载媒体。
+- **链接消息失败**：确认用户账号能打开该消息，并且消息包含实际的 Telegram 文件。链接的自动网页预览本身不是可下载媒体；即使存在该预览，受支持的 Telegram 消息链接仍会路由到链接目标。
 - **中断后从零开始下载**：这是 v0.1 预期行为。支持任务恢复，但不保证字节级断点续传。

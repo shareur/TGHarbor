@@ -31,7 +31,7 @@ TGHarbor 采用净室方式独立实现，用于下载、整理和归档 Telegra
 
 | 分类 | 文档 |
 | --- | --- |
-| 0 — 准备 | [001 — 开发准备](0-foundation/001-development-setup.md) |
+| 0 — 准备 | [001 — 开发准备](0-foundation/001-development-setup.md) · [002 — 功能概览](0-foundation/002-feature-overview.md) |
 | 1 — 整体架构 | [101 — 系统架构概览](1-architecture/101-system-overview.md) |
 | 2 — 实现 | [201 — v0.1 核心下载器](2-implementation/201-v0-1-core-downloader.md) |
 | 3 — 运维 | [301 — 核心下载器运维](3-operations/301-core-downloader-operations.md) |

@@ -63,7 +63,7 @@ class TelethonMediaProvider:
             _raise_download_error(error)
         if message is None:
             raise PermanentDownloadError("Telegram message was not found or is inaccessible")
-        if getattr(message, "media", None) is None:
+        if getattr(message, "file", None) is None:
             raise PermanentDownloadError("Telegram message has no downloadable media")
         return message
 

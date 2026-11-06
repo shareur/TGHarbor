@@ -26,6 +26,15 @@ Use `tgharbor login` once in a trusted interactive terminal to create the user
 session, then use `tgharbor run` (or simply `tgharbor`) to start the service.
 The service refuses to prompt for a verification code during unattended startup.
 
+TGHarbor is operated through a Bot, but v0.1 deliberately uses two Telegram
+clients. The Bot token authenticates the Bot and downloads media sent or forwarded
+directly to it. The phone number authorizes a separate user-account session used
+only to open submitted single-message links that the account can already access.
+The phone number is not the Bot login, and it may remain `null` in `config.yaml` so
+the one-time `tgharbor login` command prompts for it locally. The persisted user
+session prevents repeated phone/code prompts. Because message-link downloads are a
+v0.1 requirement, service startup currently requires this authorized user session.
+
 ## Configuration
 
 ```bash

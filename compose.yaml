@@ -1,6 +1,9 @@
 services:
   tgharbor:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tgharbor:0.1
     container_name: tgharbor
     restart: unless-stopped
     init: true
@@ -15,8 +18,32 @@ services:
       TGHARBOR_DOWNLOADS_PATH: /downloads
     volumes:
       - ./config.yaml:/config/config.yaml:ro
-      - ./data:/data
-      - ./downloads:/downloads
+      - type: volume
+        source: tgharbor_data
+        target: /data
+        volume:
+          nocopy: true
+      - type: volume
+        source: tgharbor_downloads
+        target: /downloads
+        volume:
+          nocopy: true
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 30s
+volumes:
+  tgharbor_data:
+    name: tgharbor_data
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/tgharbor/data
+
+  tgharbor_downloads:
+    name: tgharbor_downloads
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/tgharbor/downloads

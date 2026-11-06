@@ -34,22 +34,45 @@ tgharbor run --config config.yaml
 
 Run login only in a trusted interactive terminal. The verification code and
 two-step password are passed directly to Telethon and are not sent through the Bot.
+This command authorizes the separate user-account client for submitted message
+links; it does not log in the Bot. The Bot itself uses the BotFather token. The
+phone setting is optional because the login command can prompt for it, and the
+resulting session is persisted under the configured sessions path.
 
 ## Docker startup
 
-The user session must exist before unattended service startup:
+The supplied Compose file expects application files under any operator-selected
+directory, while its bind-backed named volumes use `/data/tgharbor/data` for the
+database and Telegram sessions and `/data/tgharbor/downloads` for completed media.
+For the standard Ubuntu layout, place the application in `/opt/TGHarbor` and prepare
+the persistent directories for the UID/GID configured in `.env`:
 
 ```bash
-docker compose build
+sudo install -d -o 1000 -g 1000 -m 0750 \
+  /opt/TGHarbor \
+  /data/tgharbor/data \
+  /data/tgharbor/downloads
+```
+
+Replace `1000:1000` when `TGHARBOR_UID:TGHARBOR_GID` uses another identity. The
+user session must exist before unattended service startup:
+
+```bash
+cd /opt/TGHarbor
+chmod 600 .env config.yaml
+docker compose build --pull
 docker compose run --rm tgharbor login
+sudo chmod 600 /data/tgharbor/data/sessions/*.session
 docker compose up -d
 docker compose logs -f tgharbor
 ```
 
-Compose maps `config.yaml` read-only, and maps `data/` and `downloads/` read-write.
-The database and both Telegram sessions live under `data/`; recreating the container
-does not remove them. Do not scale the service above one replica: v0.1 deliberately
-uses one application-instance lock and multiple Workers inside that process.
+Compose maps `config.yaml` read-only and mounts both `/data/tgharbor` bind sources
+read-write through named volumes. Volume copy-up is disabled so first use cannot
+replace host ownership with the image user's UID/GID. The database and both Telegram
+sessions live under `/data/tgharbor/data`; recreating the container does not remove
+them. Do not scale the service above one replica: v0.1 deliberately uses one
+application-instance lock and multiple Workers inside that process.
 
 ## Bot use
 
@@ -87,6 +110,8 @@ exhausted work fails, and persisted cancellation requests become cancelled.
   delete the lock file to bypass a live lock; the operating-system lock, not the
   file contents, establishes ownership.
 - **A linked message fails**: confirm the user account can open that exact message
-  and that it contains downloadable media.
+  and that it contains an actual Telegram file. A link's automatic web-page preview
+  is not itself downloadable media; supported Telegram message links are routed to
+  the linked target even when that preview is present.
 - **Interrupted download restarts from zero**: expected in v0.1. Job recovery is
   supported; byte-range resume is not guaranteed.

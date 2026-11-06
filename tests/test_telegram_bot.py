@@ -24,12 +24,13 @@ class FakeEvent:
         sender_id: int,
         text: str = "",
         media: object | None = None,
+        file: object | None = None,
         chat_id: int = 1001,
         message_id: int = 10,
     ) -> None:
         self.sender_id = sender_id
         self.raw_text = text
-        self.message = SimpleNamespace(media=media)
+        self.message = SimpleNamespace(media=media, file=file)
         self.chat_id = chat_id
         self.id = message_id
         self.responses: list[str] = []
@@ -57,7 +58,13 @@ async def test_unauthorized_user_cannot_submit(tmp_path: Path) -> None:
 
 async def test_media_is_enqueued_for_bot_session(tmp_path: Path) -> None:
     bot, queue = await controller(tmp_path)
-    event = FakeEvent(sender_id=1001, media=object(), chat_id=1001, message_id=77)
+    event = FakeEvent(
+        sender_id=1001,
+        media=object(),
+        file=object(),
+        chat_id=1001,
+        message_id=77,
+    )
 
     await bot.handle_event(event)
     job = await queue.claim_next("worker")
@@ -82,9 +89,40 @@ async def test_link_is_enqueued_for_user_session(tmp_path: Path) -> None:
     assert job.source_message_id == 88
 
 
+async def test_link_preview_is_enqueued_for_user_session(tmp_path: Path) -> None:
+    bot, queue = await controller(tmp_path)
+    event = FakeEvent(
+        sender_id=1001,
+        text="https://t.me/example_channel/88",
+        media=object(),
+    )
+
+    await bot.handle_event(event)
+    job = await queue.claim_next("worker")
+
+    assert job is not None
+    assert job.source_session is SourceSession.USER
+    assert job.source_chat == "example_channel"
+    assert job.source_message_id == 88
+
+
+async def test_webpage_preview_without_telegram_link_is_rejected(tmp_path: Path) -> None:
+    bot, queue = await controller(tmp_path)
+    event = FakeEvent(
+        sender_id=1001,
+        text="https://example.com/video",
+        media=object(),
+    )
+
+    await bot.handle_event(event)
+
+    assert event.responses[0].startswith("Cannot create job:")
+    assert await queue.claim_next("worker") is None
+
+
 async def test_status_and_cancel_are_owner_scoped(tmp_path: Path) -> None:
     bot, queue = await controller(tmp_path)
-    submit = FakeEvent(sender_id=1001, media=object(), message_id=99)
+    submit = FakeEvent(sender_id=1001, media=object(), file=object(), message_id=99)
     await bot.handle_event(submit)
     job = (await queue.latest_for_requester(1001))[0]
 

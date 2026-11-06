@@ -1,22 +1,41 @@
+# Copy to config.yaml. Prefer .env for Telegram credentials; supported
+# environment variables override the null values below.
 telegram:
+  # API ID and API hash identify the Telegram application used by Telethon for
+  # both clients. They are not the Bot token.
   api_id: null
   api_hash: null
+
+  # BotFather token for the Bot that receives commands and forwarded media.
   bot_token: null
+
+  # Optional at login time: authorizes the separate user client used only to
+  # open submitted t.me message links. If null, `tgharbor login` prompts locally.
+  # It is not used to authenticate the Bot.
   phone: null
+
+  # Numeric Telegram user IDs allowed to submit and manage download jobs.
   authorized_users: []
 
 downloads:
+  # Compose overrides this path with /downloads.
   path: ./downloads
+  # Number of asynchronous download workers in this single service instance.
   concurrency: 2
+  # Per-attempt timeout and bounded retry policy.
   timeout_seconds: 3600
   max_attempts: 3
   retry_base_seconds: 5
 
 database:
+  # Compose overrides this path with /data/tgharbor.db.
   path: ./data/tgharbor.db
 
 sessions:
+  # Stores persistent Bot and user-account Telethon sessions. Compose overrides
+  # this path with /data/sessions; protect and back up that directory.
   path: ./data/sessions
 
 logging:
+  # One of CRITICAL, ERROR, WARNING, INFO, or DEBUG.
   level: INFO

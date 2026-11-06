@@ -35,6 +35,7 @@ Bot token, and Docker host are still required for deployment-specific acceptance
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Complete v0.1 feature overview](docs/0-foundation/002-feature-overview.md)
 - [v0.1 implementation and acceptance](docs/2-implementation/201-v0-1-core-downloader.md)
 - [Operations guide](docs/3-operations/301-core-downloader-operations.md)
 - [中文文档](docs/zh-CN/README.md)

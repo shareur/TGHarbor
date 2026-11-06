@@ -53,7 +53,12 @@ class TelegramBotController:
         if command == "/cancel":
             await self._cancel(event, requester_id, text)
             return
-        if getattr(event.message, "media", None) is not None:
+        try:
+            reference = parse_message_link(text)
+        except MessageReferenceError as error:
+            if getattr(event.message, "file", None) is None:
+                await event.respond(f"Cannot create job: {error}\n\n{_HELP}")
+                return
             job = await self.jobs.submit(
                 requester_id,
                 SourceSession.BOT,
@@ -61,11 +66,6 @@ class TelegramBotController:
                 event.id,
             )
             await event.respond(_accepted(job))
-            return
-        try:
-            reference = parse_message_link(text)
-        except MessageReferenceError as error:
-            await event.respond(f"Cannot create job: {error}\n\n{_HELP}")
             return
         job = await self.jobs.submit(
             requester_id,

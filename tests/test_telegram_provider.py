@@ -95,6 +95,13 @@ async def test_missing_media_is_permanent() -> None:
         await provider.describe(job())
 
 
+async def test_webpage_preview_without_file_is_permanent() -> None:
+    provider = TelethonMediaProvider(FakeClient(SimpleNamespace(media=object(), file=None)))
+
+    with pytest.raises(PermanentDownloadError, match="no downloadable media"):
+        await provider.describe(job())
+
+
 async def test_network_failure_is_retryable_without_exposing_message() -> None:
     provider = TelethonMediaProvider(FakeClient(error=OSError("secret transport details")))
 

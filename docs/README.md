@@ -4,7 +4,7 @@
 
 | Category | Documents |
 | --- | --- |
-| 0 — Foundation | [001 — Development setup](0-foundation/001-development-setup.md) |
+| 0 — Foundation | [001 — Development setup](0-foundation/001-development-setup.md) · [002 — Feature overview](0-foundation/002-feature-overview.md) |
 | 1 — Architecture | [101 — System overview](1-architecture/101-system-overview.md) |
 | 2 — Implementation | [201 — v0.1 Core Downloader](2-implementation/201-v0-1-core-downloader.md) |
 | 3 — Operations | [301 — Core Downloader operations](3-operations/301-core-downloader-operations.md) |
