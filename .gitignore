@@ -1,0 +1,72 @@
+# Python environments and bytecode
+.venv/
+venv/
+__pypackages__/
+__pycache__/
+*.py[cod]
+
+# Test, lint, type-check, and coverage artifacts
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+
+# Build and packaging artifacts
+*.egg-info/
+dist/
+build/
+
+# Local configuration and secrets; keep sanitized examples
+/config.yaml
+/config.yml
+/config.local.yaml
+/config.local.yml
+/.env
+/.env.*
+!/.env.example
+
+# Telegram credentials and session state
+*.session
+*.session-*
+
+# Runtime databases, locks, logs, and user content
+*.db
+*.db-*
+*.db.lock
+*.sqlite
+*.sqlite-*
+*.sqlite.lock
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.lock
+*.log
+/data/
+/downloads/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+.fleet/
+*.swp
+*.swo
+*~
+
+# Local reference material
+/reference/
+/reference
+
+# Local agent workspace
+/AGENTS.md
+/agents.md
+/agent.md
+/docs/handoff.md

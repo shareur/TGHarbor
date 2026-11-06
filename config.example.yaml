@@ -1,0 +1,22 @@
+telegram:
+  api_id: null
+  api_hash: null
+  bot_token: null
+  phone: null
+  authorized_users: []
+
+downloads:
+  path: ./downloads
+  concurrency: 2
+  timeout_seconds: 3600
+  max_attempts: 3
+  retry_base_seconds: 5
+
+database:
+  path: ./data/tgharbor.db
+
+sessions:
+  path: ./data/sessions
+
+logging:
+  level: INFO

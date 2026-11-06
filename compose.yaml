@@ -1,0 +1,22 @@
+services:
+  tgharbor:
+    build: .
+    container_name: tgharbor
+    restart: unless-stopped
+    init: true
+    user: "${TGHARBOR_UID:-1000}:${TGHARBOR_GID:-1000}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TGHARBOR_CONFIG: /config/config.yaml
+      TGHARBOR_DATABASE_PATH: /data/tgharbor.db
+      TGHARBOR_SESSIONS_PATH: /data/sessions
+      TGHARBOR_DOWNLOADS_PATH: /downloads
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data
+      - ./downloads:/downloads
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
