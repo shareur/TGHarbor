@@ -113,13 +113,27 @@ CI has read-only repository permissions, checks out complete history, pins Actio
 immutable commit SHAs, runs dependency auditing, and scans secrets. Dependabot opens
 bounded weekly updates for Python, Actions, and Docker dependencies.
 
+The secret scan installs the pinned Gitleaks CLI release `8.30.1` into
+`$RUNNER_TEMP` instead of running a marketplace Action, verifies the official
+`linux_x64` archive SHA-256
+`551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb` before
+extraction, and passes no token or license secret to the scanner. It scans the
+complete reachable history of the checked-out repository rather than a push,
+pull-request, or tag event range, so an initial branch push, a normal push, a pull
+request, and a tag push all use the same full-history gate. It refuses to report a
+clean result when no commit is checked out or when the checkout is shallow. Findings
+are printed with 100% redaction, no banner or color, and an exit code of `2`; a finding
+fails the job as a secret incident, while any other non-zero exit is reported as an
+operational scanner failure and must never be described as a clean scan.
+
 Never paste secrets, session files, message contents, private links, database rows,
 or raw diagnostic objects into issues or pull requests. Security reports should use
 the private process in `SECURITY.md` once a maintainer contact is published.
 
 ## Release record
 
-Record scanner versions, ref count, object count, image digest, candidate commit,
+Record scanner versions and their pinned archive checksums, ref count, object count,
+image digest, candidate commit,
 artifact names, sizes, SHA-256 hashes, versions, commands, outcomes, false-positive
 decisions, and any rotations in the local handoff. Do not record the credential
 values, private hostnames, account IDs, or user-content paths.
