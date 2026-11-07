@@ -14,13 +14,13 @@ Copy and edit the examples:
 ```bash
 cp config.example.yaml config.yaml
 cp .env.example .env
-mkdir -p data downloads
+cp compose.example.yaml compose.yaml
 ```
 
 For a local Python process, put values in the ignored `config.yaml` or export the
 documented environment variables. Compose loads the ignored `.env` automatically.
-On Linux, set `TGHARBOR_UID` and `TGHARBOR_GID` to the owner of `data/` and
-`downloads/`.
+The local `compose.yaml`, `config.yaml`, and `.env` files are intentionally ignored;
+only their sanitized examples belong in Git.
 
 ## Local startup
 
@@ -41,62 +41,99 @@ resulting session is persisted under the configured sessions path.
 
 ## Docker startup
 
-The supplied Compose file expects application files under any operator-selected
-directory, while its bind-backed named volumes use `/data/tgharbor/data` for the
-database and Telegram sessions and `/data/tgharbor/downloads` for completed media.
-For the standard Ubuntu layout, place the application in `/opt/TGHarbor` and prepare
-the persistent directories for the UID/GID configured in `.env`:
+The example uses project-scoped Docker-managed volumes named `tgharbor_data` and
+`tgharbor_downloads`. It contains no fixed host storage path and runs as the non-root
+user built into the image. It pins the local image name to `tgharbor:0.2.0` rather
+than a floating minor tag. The user session must exist before unattended startup:
 
 ```bash
-sudo install -d -o 1000 -g 1000 -m 0750 \
-  /opt/TGHarbor \
-  /data/tgharbor/data \
-  /data/tgharbor/downloads
-```
-
-Replace `1000:1000` when `TGHARBOR_UID:TGHARBOR_GID` uses another identity. The
-user session must exist before unattended service startup:
-
-```bash
-cd /opt/TGHarbor
 chmod 600 .env config.yaml
 docker compose build --pull
 docker compose run --rm tgharbor login
-sudo chmod 600 /data/tgharbor/data/sessions/*.session
 docker compose up -d
 docker compose logs -f tgharbor
 ```
 
-Compose maps `config.yaml` read-only and mounts both `/data/tgharbor` bind sources
-read-write through named volumes. Volume copy-up is disabled so first use cannot
-replace host ownership with the image user's UID/GID. The database and both Telegram
-sessions live under `/data/tgharbor/data`; recreating the container does not remove
-them. Do not scale the service above one replica: v0.1 deliberately uses one
-application-instance lock and multiple Workers inside that process.
+The Compose build uses OCI provenance defaults that identify an uncommitted local
+build. A release image must instead be built from an immutable candidate with the
+revision, source, and created arguments required by the
+[release-security procedure](302-release-security.md#container-identity-and-provenance).
+The local `tgharbor:0.2.0` tag is not an immutable deployment identity; verify and
+record the release image digest before any rollout.
+
+Compose maps `config.yaml` read-only. The database and both Telegram sessions live in
+the data volume; completed media and organization state live in the downloads volume.
+Recreating the container preserves both volumes, while `docker compose down -v`
+deletes them and must not be used unless their contents are intentionally disposable
+or already backed up. Do not scale the service above one replica: TGHarbor deliberately
+uses one application-instance lock and multiple Workers inside that process.
+
+### Optional host bind mounts
+
+Operators who require visible host paths can edit their ignored `compose.yaml` and
+replace the two named-volume mounts with bind mounts:
+
+```yaml
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - /srv/tgharbor/data:/data
+      - /srv/tgharbor/downloads:/downloads
+```
+
+Create those directories for the image user before startup:
+
+```bash
+sudo install -d -o 10001 -g 10001 -m 0750 \
+  /srv/tgharbor/data \
+  /srv/tgharbor/downloads
+```
+
+If an operator explicitly overrides the container user, both bind sources must use
+that same UID/GID. Keep host-specific paths and identity overrides only in the ignored
+local Compose file, never in `compose.example.yaml`.
 
 ## Bot use
 
 - Send or forward one media message in a private conversation with the Bot.
 - Send one `https://t.me/<name>/<id>` or `https://t.me/c/<id>/<id>` link.
-- Use `/status` for recent tasks or `/status <job-id>` for one task.
+- Use `/status` for pending/running tasks, `/status <job-id>` for one task, and
+  `/history [page]` for terminal history.
 - Use `/cancel <job-id>` to cancel pending work or request cancellation of running
   work.
+- Use `/files [page]`, `/dirs [page]`, and `/stats` to inspect the shared library.
+- Use `/rename`, `/archive`, and `/mkdir`, or the completion-notification buttons, to
+  organize files. Every authorized user shares this library; changes audit the actor.
 
 The user account must already be able to open linked messages. The service does not
 crawl history or bypass Telegram permissions.
 
 ## Backup and restore
 
-Stop the service before making a filesystem-level backup:
+Treat the complete data and downloads volumes as one restore point. Stop the service,
+create both archives through one-off Compose containers, and securely copy the local
+configuration files:
 
 ```bash
 docker compose stop tgharbor
+install -d -m 0700 backup
+docker compose run --rm --no-deps --user 0:0 --entrypoint tar \
+  -v "$PWD/backup:/backup" tgharbor \
+  -cpf /backup/data-volume.tar -C /data .
+docker compose run --rm --no-deps --user 0:0 --entrypoint tar \
+  -v "$PWD/backup:/backup" tgharbor \
+  -cpf /backup/downloads-volume.tar -C /downloads .
+tar -cpf backup/private-config.tar .env config.yaml compose.yaml
+sha256sum backup/*.tar > backup/SHA256SUMS
 ```
 
-Back up `config.yaml` securely, plus `data/` and `downloads/`. They contain secrets
-and user content. Restore them with the same ownership and paths, then start the
-service. On startup, running jobs are reconciled: retryable work returns to pending,
-exhausted work fails, and persisted cancellation requests become cancelled.
+Verify `SHA256SUMS` before restoring. With the service stopped and the intended empty
+or replaceable volumes mounted, use the same one-off pattern with `tar -xpf` into
+`/data` and `/downloads`, restore the matching private configuration, and start the
+service. Never combine the database from one backup with downloads from another.
+Bind-mount deployments archive the complete host directories instead, preserving
+ownership and permissions. On startup, running jobs, organization intents, and tracked
+legacy outputs are reconciled before normal Bot handling. For schema-1 upgrades,
+follow the [v0.2 upgrade and rollback guide](303-v0-2-upgrade.md).
 
 ## Troubleshooting
 
@@ -104,8 +141,10 @@ exhausted work fails, and persisted cancellation requests become cancelled.
   command in an interactive terminal.
 - **Unauthorized**: add the sender's numeric ID to `authorized_users` or
   `TGHARBOR_TELEGRAM_AUTHORIZED_USERS`, then restart.
-- **Permission denied under `/data` or `/downloads`**: make the host directories
-  writable by `TGHARBOR_UID:TGHARBOR_GID`.
+- **Permission denied under `/data` or `/downloads`**: for default named volumes,
+  confirm the service uses the image's built-in user and recreate only a new empty
+  volume after diagnosing ownership. For bind mounts, make both host directories
+  writable by the configured container UID/GID.
 - **Another instance is using the state directory**: stop the other process. Do not
   delete the lock file to bypass a live lock; the operating-system lock, not the
   file contents, establishes ownership.
@@ -113,5 +152,5 @@ exhausted work fails, and persisted cancellation requests become cancelled.
   and that it contains an actual Telegram file. A link's automatic web-page preview
   is not itself downloadable media; supported Telegram message links are routed to
   the linked target even when that preview is present.
-- **Interrupted download restarts from zero**: expected in v0.1. Job recovery is
+- **Interrupted download restarts from zero**: expected. Job recovery is
   supported; byte-range resume is not guaranteed.

@@ -11,10 +11,10 @@
 ```bash
 cp config.example.yaml config.yaml
 cp .env.example .env
-mkdir -p data downloads
+cp compose.example.yaml compose.yaml
 ```
 
-本地 Python 进程可把值写入已忽略的 `config.yaml`，或导出文档列出的环境变量。Compose 会自动加载已忽略的 `.env`。在 Linux 上，把 `TGHARBOR_UID` 和 `TGHARBOR_GID` 设置为 `data/` 与 `downloads/` 所有者的 UID/GID。
+本地 Python 进程可把值写入已忽略的 `config.yaml`，或导出文档列出的环境变量。Compose 会自动加载已忽略的 `.env`。本地 `compose.yaml`、`config.yaml` 和 `.env` 均应保持忽略状态；Git 中只保留脱敏示例。
 
 ## 本地启动
 
@@ -31,53 +31,76 @@ tgharbor run --config config.yaml
 
 ## Docker 启动
 
-所提供的 Compose 文件允许运维者自行选择应用目录，但其绑定宿主目录的命名卷固定使用 `/data/tgharbor/data` 保存数据库和 Telegram 会话，并使用 `/data/tgharbor/downloads` 保存完成媒体。标准 Ubuntu 布局把应用放在 `/opt/TGHarbor`，并按 `.env` 中配置的 UID/GID 准备持久目录：
+示例使用项目范围内由 Docker 管理的 `tgharbor_data` 与 `tgharbor_downloads` 命名卷，不包含固定宿主存储路径，并以内建非 root 镜像用户运行。它把本地镜像名称固定为 `tgharbor:0.2.0`，而不是浮动的次版本标签。无人值守启动前必须先创建用户会话：
 
 ```bash
-sudo install -d -o 1000 -g 1000 -m 0750 \
-  /opt/TGHarbor \
-  /data/tgharbor/data \
-  /data/tgharbor/downloads
-```
-
-如果 `TGHARBOR_UID:TGHARBOR_GID` 使用其他身份，请替换 `1000:1000`。无人值守服务启动前必须先创建用户会话：
-
-```bash
-cd /opt/TGHarbor
 chmod 600 .env config.yaml
 docker compose build --pull
 docker compose run --rm tgharbor login
-sudo chmod 600 /data/tgharbor/data/sessions/*.session
 docker compose up -d
 docker compose logs -f tgharbor
 ```
 
-Compose 以只读方式映射 `config.yaml`，并通过命名卷以读写方式挂载两个 `/data/tgharbor` 宿主来源。卷已禁用首次复制，避免第一次使用时把宿主目录所有权替换为镜像用户的 UID/GID。数据库和两个 Telegram 会话位于 `/data/tgharbor/data` 下；重建容器不会删除它们。不要把服务扩展到多个副本：v0.1 明确使用一个应用实例锁，并在该进程内运行多个 Worker。
+Compose 构建使用 OCI 来源默认值，将镜像标识为未提交的本地构建。发布镜像必须改为从不可变候选构建，并按[发布安全流程](302-release-security.md#容器身份与来源)提供 revision、source 和 created 参数。本地 `tgharbor:0.2.0` 标签不是不可变部署身份；任何上线前都必须验证并记录发布镜像摘要。
+
+Compose 以只读方式映射 `config.yaml`。数据库和两个 Telegram 会话位于数据卷，完成媒体与整理状态位于下载卷。重建容器会保留两个卷；`docker compose down -v` 会删除它们，除非数据明确可丢弃或已有备份，否则不得使用。不要把服务扩展到多个副本：TGHarbor 明确使用一个应用实例锁，并在该进程内运行多个 Worker。
+
+### 可选宿主 bind mount
+
+需要直接查看宿主路径的运维者，可编辑被忽略的本地 `compose.yaml`，把两个命名卷替换为 bind mount：
+
+```yaml
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - /srv/tgharbor/data:/data
+      - /srv/tgharbor/downloads:/downloads
+```
+
+启动前为镜像用户创建目录：
+
+```bash
+sudo install -d -o 10001 -g 10001 -m 0750 \
+  /srv/tgharbor/data \
+  /srv/tgharbor/downloads
+```
+
+若显式覆盖容器用户，两个宿主来源必须使用同一 UID/GID。宿主专用路径及身份覆盖只能写入被忽略的本地 Compose 文件，不得进入 `compose.example.yaml`。
 
 ## Bot 使用
 
 - 在 Bot 私聊中发送或转发一条媒体消息。
 - 发送一条 `https://t.me/<name>/<id>` 或 `https://t.me/c/<id>/<id>` 链接。
-- 使用 `/status` 查看近期任务，或用 `/status <job-id>` 查看单个任务。
+- 使用 `/status` 查看 pending/running 任务，用 `/status <job-id>` 查看单个任务，并用 `/history [page]` 查看终态历史。
 - 使用 `/cancel <job-id>` 取消等待任务或请求取消运行任务。
+- 使用 `/files [page]`、`/dirs [page]` 和 `/stats` 查看共享文件库。
+- 使用 `/rename`、`/archive`、`/mkdir` 或完成通知按钮整理文件。所有授权用户共享该文件库，变更会审计操作者。
 
 用户账号必须原本就能打开链接消息。服务不会抓取历史，也不会绕过 Telegram 权限。
 
 ## 备份与恢复
 
-执行文件系统级备份前先停止服务：
+完整数据卷和下载卷必须作为一个恢复点。停止服务，通过一次性 Compose 容器分别创建两个归档，并安全复制本地配置：
 
 ```bash
 docker compose stop tgharbor
+install -d -m 0700 backup
+docker compose run --rm --no-deps --user 0:0 --entrypoint tar \
+  -v "$PWD/backup:/backup" tgharbor \
+  -cpf /backup/data-volume.tar -C /data .
+docker compose run --rm --no-deps --user 0:0 --entrypoint tar \
+  -v "$PWD/backup:/backup" tgharbor \
+  -cpf /backup/downloads-volume.tar -C /downloads .
+tar -cpf backup/private-config.tar .env config.yaml compose.yaml
+sha256sum backup/*.tar > backup/SHA256SUMS
 ```
 
-安全备份 `config.yaml`、`data/` 和 `downloads/`；其中包含秘密和用户内容。按相同所有权和路径恢复后启动服务。启动时会对运行任务进行对账：可重试任务回到 pending，耗尽任务失败，已持久化的取消请求进入 cancelled。
+恢复前验证 `SHA256SUMS`。保持服务停止，把目标空卷或可替换卷挂载后，以相同的一次性容器方式通过 `tar -xpf` 分别恢复到 `/data` 和 `/downloads`，再恢复匹配的私有配置并启动服务。不得混用不同备份中的数据库与下载内容。bind-mount 部署应归档完整宿主目录并保留所有权和权限。正常 Bot 处理前会对账运行任务、整理意图和已跟踪 legacy 输出。Schema 1 升级请遵循 [v0.2 升级与回滚指南](303-v0-2-upgrade.md)。
 
 ## 故障排查
 
 - **用户会话未授权**：在交互式终端重新执行 `tgharbor login` 或 Compose 登录命令。
 - **Unauthorized**：把发送者数字 ID 加入 `authorized_users` 或 `TGHARBOR_TELEGRAM_AUTHORIZED_USERS`，然后重启。
-- **`/data` 或 `/downloads` 权限不足**：让宿主目录对 `TGHARBOR_UID:TGHARBOR_GID` 可写。
+- **`/data` 或 `/downloads` 权限不足**：默认命名卷应确认服务使用镜像内建用户；诊断所有权后只能重建新的空卷。bind mount 应让两个宿主目录对配置的容器 UID/GID 可写。
 - **其他实例正在使用状态目录**：停止其他进程。不要通过删除锁文件绕过运行中的锁；所有权由操作系统锁而非文件内容确定。
 - **链接消息失败**：确认用户账号能打开该消息，并且消息包含实际的 Telegram 文件。链接的自动网页预览本身不是可下载媒体；即使存在该预览，受支持的 Telegram 消息链接仍会路由到链接目标。
-- **中断后从零开始下载**：这是 v0.1 预期行为。支持任务恢复，但不保证字节级断点续传。
+- **中断后从零开始下载**：这是预期行为。支持任务恢复，但不保证字节级断点续传。

@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible TGHarbor defect without sensitive data
+title: "[Bug]: "
+labels: [ bug ]
+body:
+- type: markdown
+  attributes:
+    value: Do not include credentials, sessions, private links, user content, databases, logs, or deployment identifiers.
+- type: input
+  id: version
+  attributes:
+    label: Version or commit
+  validations:
+    required: true
+- type: textarea
+  id: behavior
+  attributes:
+    label: Observed behavior
+    description: Use sanitized identifiers and content.
+  validations:
+    required: true
+- type: textarea
+  id: expected
+  attributes:
+    label: Expected behavior
+  validations:
+    required: true
+- type: textarea
+  id: reproduction
+  attributes:
+    label: Sanitized reproduction
+  validations:
+    required: true
+- type: textarea
+  id: verification
+  attributes:
+    label: Relevant checks
+    description: Include command outcomes, not secrets or raw private logs.

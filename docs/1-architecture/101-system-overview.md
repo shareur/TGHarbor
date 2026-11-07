@@ -32,9 +32,23 @@ Telegram / future REST API / CLI
 5. Storage routing is independent from providers.
 6. UI/API layers should not own download state.
 
-## v0.1 adapters
+The shared-library path is separate from download-state ownership:
 
-v0.1 uses two independent Telegram sessions behind the same Provider contract:
+```text
+Telegram Bot
+     |
+     v
+ Library API ------> SQLite catalog and audit
+     |                         |
+     +-------------------------+
+                   |
+                   v
+             Local Storage
+```
+
+## Telegram adapters
+
+TGHarbor uses two independent Telegram sessions behind the same Provider contract:
 
 - The Bot session receives media sent or forwarded by an authorized user and
   downloads the Bot-visible message.
@@ -45,6 +59,11 @@ The authorization boundary is the Job API. A Telegram user ID is checked before
 job creation, lookup, or cancellation. Jobs remain requester-scoped. The Bot only
 handles private conversations; verification codes and two-step-verification
 passwords are accepted only by the local `tgharbor login` command.
+
+The Library API forms a second authorization boundary. All configured authorized
+users share completed-file visibility and organization rights. Mutating operations
+record the acting Telegram user ID, validate catalog state again, and never infer job
+ownership from shared-library access.
 
 ## Queue semantics
 
@@ -57,26 +76,31 @@ pending --claim--> running --success--> completed
 running --cancel request observed----------------> cancelled
 ```
 
-SQLite stores the state, source reference, requester, attempt count, progress,
-retry availability, ownership, error, and output path. One SQL statement claims a
-pending row and assigns it to one Worker. Worker-owned state updates include both
-the job ID and worker ID. v0.1 runs one application instance with multiple
+SQLite stores the state, source reference, requester, bounded display metadata,
+attempt count, progress, retry availability, ownership, error, and output path. One
+SQL statement claims a pending row and assigns it to one Worker. Worker-owned state
+updates include both the job ID and worker ID. TGHarbor runs one application instance with multiple
 asynchronous Workers; a database-adjacent process lock rejects a second instance.
 
 At startup, interrupted running jobs below their attempt limit return to pending.
 Exhausted jobs become failed, and persisted cancellation requests become cancelled.
 This is job-level restart recovery: partial bytes are discarded and downloaded
-again. Byte-range resume is not a v0.1 guarantee.
+again. Byte-range resume is not a current guarantee.
 
 ## Storage and completion
 
-Each job writes to its own directory under the configured download root. Names are
-sanitized, resolved paths must stay below the root, and symbolic-link targets are
-rejected. A Worker writes a `.part` file, synchronizes it, atomically renames it,
-and synchronizes the directory before marking the database row completed. If a
-process stops after the rename but before the database update, the replacement
-Worker recognizes the completed file and reconciles the row without downloading it
-again.
+Storage divides the configured root into shared `inbox/`, shared `archive/`, and
+hidden `.partial/` areas. A Worker reserves a collision-safe Inbox name in SQLite,
+writes into a per-job partial area, synchronizes the file, and commits it with
+no-overwrite semantics before completing the job and catalog row in one database
+transaction. Resolved paths must stay below the root; symbolic links and unexpected
+filesystem object types are rejected.
+
+Rename and archive operations persist a filesystem intent before moving a file, then
+update the catalog and actor audit before removing that intent. Startup reconciliation
+finishes a safe interrupted move or rejects changed and ambiguous state. A separate
+one-time reconciler moves tracked v0.1 UUID-directory outputs into Inbox without
+overwriting unrelated files.
 
 Provider failures are classified as permanent or retryable. Retryable failures use
 bounded exponential delay and honor a longer Telegram flood-wait interval. Terminal

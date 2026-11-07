@@ -30,6 +30,10 @@ build/
 /config.yml
 /config.local.yaml
 /config.local.yml
+/compose.yaml
+/compose.override.yaml
+/compose.local.yaml
+/compose.*.local.yaml
 /.env
 /.env.*
 !/.env.example
@@ -64,6 +68,8 @@ build/
 # Local reference material
 /reference/
 /reference
+/archive/
+/docs-local/
 
 # Local agent workspace
 /AGENTS.md

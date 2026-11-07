@@ -70,11 +70,26 @@ class DownloadWorker:
             provider = self.providers[job.source_session]
             async with asyncio.timeout(self.settings.timeout_seconds):
                 descriptor = await provider.describe(job)
-                target = await self.storage.prepare(
-                    job, job.destination_name or descriptor.file_name
+                job = await self.queue.update_metadata(
+                    job.id,
+                    worker_id,
+                    display_title=descriptor.display_title,
+                    original_file_name=descriptor.file_name,
+                    mime_type=descriptor.mime_type,
+                    total_bytes=descriptor.total_bytes,
                 )
+                desired_name = self.storage.normalize_name(
+                    job.destination_name or descriptor.file_name
+                )
+                job = await self.queue.reserve_name(job.id, worker_id, desired_name)
+                target = await self.storage.prepare(job, desired_name)
                 if self.storage.is_complete(target):
-                    completed = await self.queue.complete(job.id, worker_id, target.final_path)
+                    completed = await self.queue.complete(
+                        job.id,
+                        worker_id,
+                        target.final_path,
+                        relative_path=self.storage.relative_path(target.final_path),
+                    )
                     await self._publish(completed)
                     return
                 progress = _ProgressReporter(
@@ -87,7 +102,12 @@ class DownloadWorker:
                 if await self.queue.is_cancel_requested(job.id, worker_id):
                     raise JobCancellationRequested
                 output = await self.storage.commit(target)
-                completed = await self.queue.complete(job.id, worker_id, output)
+                completed = await self.queue.complete(
+                    job.id,
+                    worker_id,
+                    output,
+                    relative_path=self.storage.relative_path(output),
+                )
                 await self._publish(completed)
         except JobCancellationRequested:
             if target is not None:

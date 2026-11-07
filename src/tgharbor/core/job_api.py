@@ -4,7 +4,7 @@ from collections.abc import Callable
 from uuid import UUID
 
 from tgharbor.core.interfaces import JobQueue
-from tgharbor.core.jobs import DownloadJob, NewDownloadJob, SourceSession
+from tgharbor.core.jobs import DownloadJob, JobStatus, NewDownloadJob, SourceSession
 
 
 class UnauthorizedUserError(PermissionError):
@@ -59,9 +59,47 @@ class JobAPI:
             raise JobNotFoundError(str(job_id))
         return job
 
-    async def latest(self, requester_id: int, *, limit: int = 10) -> list[DownloadJob]:
+    async def latest(
+        self, requester_id: int, *, limit: int = 10, offset: int = 0
+    ) -> list[DownloadJob]:
         self.require_authorized(requester_id)
-        return await self.queue.latest_for_requester(requester_id, limit=limit)
+        return await self.queue.latest_for_requester(requester_id, limit=limit, offset=offset)
+
+    async def active(
+        self, requester_id: int, *, limit: int = 10, offset: int = 0
+    ) -> list[DownloadJob]:
+        self.require_authorized(requester_id)
+        return await self.queue.latest_for_requester(
+            requester_id,
+            limit=limit,
+            offset=offset,
+            statuses=frozenset({JobStatus.PENDING, JobStatus.RUNNING}),
+        )
+
+    async def history(
+        self,
+        requester_id: int,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        statuses: frozenset[JobStatus] | None = None,
+    ) -> list[DownloadJob]:
+        self.require_authorized(requester_id)
+        terminal = frozenset({JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED})
+        selected = terminal if statuses is None else statuses & terminal
+        return await self.queue.latest_for_requester(
+            requester_id,
+            limit=limit,
+            offset=offset,
+            statuses=selected,
+        )
+
+    async def resolve(self, requester_id: int, identifier: str) -> DownloadJob:
+        self.require_authorized(requester_id)
+        job = await self.queue.resolve_for_requester(requester_id, identifier)
+        if job is None:
+            raise JobNotFoundError(identifier)
+        return job
 
     async def cancel(self, requester_id: int, job_id: UUID) -> DownloadJob:
         self.require_authorized(requester_id)

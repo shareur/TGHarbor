@@ -7,6 +7,10 @@ __pycache__
 data
 downloads
 config.yaml
+compose.yaml
+compose.override.yaml
+compose.local.yaml
+compose.*.local.yaml
 .env
 .git
 .gitignore

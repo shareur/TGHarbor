@@ -30,7 +30,12 @@ class TelethonMediaProvider:
         if not name:
             name = f"telegram_{job.source_message_id}.bin"
         size = getattr(telegram_file, "size", None)
-        return MediaDescriptor(file_name=name, total_bytes=size)
+        return MediaDescriptor(
+            file_name=name,
+            total_bytes=size,
+            display_title=_display_title(getattr(message, "raw_text", None)),
+            mime_type=getattr(telegram_file, "mime_type", None),
+        )
 
     async def download(
         self, job: DownloadJob, destination: Path, progress: ProgressCallback
@@ -81,3 +86,10 @@ def _raise_download_error(error: BaseException) -> None:
     if isinstance(error, asyncio.CancelledError):
         raise error
     raise RetryableDownloadError(f"unexpected Telegram {error.__class__.__name__}") from error
+
+
+def _display_title(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    return normalized[:160] or None

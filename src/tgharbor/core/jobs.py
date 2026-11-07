@@ -24,6 +24,11 @@ class SourceSession(StrEnum):
     USER = "user"
 
 
+class FileLocation(StrEnum):
+    INBOX = "inbox"
+    ARCHIVE = "archive"
+
+
 @dataclass(frozen=True, slots=True)
 class NewDownloadJob:
     requester_id: int
@@ -77,7 +82,57 @@ class DownloadJob:
     updated_at: datetime
     claimed_by: str | None
     cancel_requested: bool
+    display_title: str | None = None
+    original_file_name: str | None = None
+    mime_type: str | None = None
+    reserved_name: str | None = None
 
     @property
     def is_terminal(self) -> bool:
         return self.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+
+    @property
+    def short_id(self) -> str:
+        return self.id.hex[:8]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredFile:
+    job_id: UUID
+    requester_id: int
+    relative_path: Path
+    original_name: str
+    current_name: str
+    display_title: str | None
+    mime_type: str | None
+    size_bytes: int
+    location: FileLocation
+    created_at: datetime
+    updated_at: datetime
+    last_operator_id: int | None
+
+    @property
+    def short_id(self) -> str:
+        return self.job_id.hex[:8]
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryStats:
+    file_count: int
+    total_bytes: int
+    inbox_count: int
+    archive_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class InteractionSession:
+    id: UUID
+    actor_id: int
+    action: str
+    step: str
+    job_id: UUID | None
+    pending_name: str | None
+    pending_directory: str | None
+    expires_at: datetime
+    created_at: datetime
+    updated_at: datetime
