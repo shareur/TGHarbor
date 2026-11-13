@@ -4,6 +4,19 @@ This project follows a Keep a Changelog style while it remains pre-1.0.
 
 ## Unreleased
 
+## 0.2.2 - 2026-11-13
+
+### Changed
+
+- Apply Ruff formatting to the release validation scripts and release metadata tests so
+  the repository-wide formatting check passes on the published source snapshot.
+- Align project and runtime version metadata with 0.2.2.
+
+Formatting-only source release: no runtime, configuration, interface, or documented
+behavior change. No container image is published for 0.2.2; the 0.2.1 Docker Hub image
+and its aliases remain the current image release, and the release workflow refuses to
+overwrite them.
+
 ## 0.2.0 - 2026-11-07
 
 ### Added

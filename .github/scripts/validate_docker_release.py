@@ -333,17 +333,13 @@ def find_successful_tag_ci(api: JsonApi, *, tag: str, sha: str) -> Mapping[str, 
             {"event": "push", "head_sha": commit, "per_page": "100", "page": str(page)}
         )
         document = _require_mapping(
-            api.get_json(
-                f"/repos/{CANONICAL_REPOSITORY}/actions/workflows/ci.yml/runs?{query}"
-            ),
+            api.get_json(f"/repos/{CANONICAL_REPOSITORY}/actions/workflows/ci.yml/runs?{query}"),
             label="CI runs",
         )
         runs = document.get("workflow_runs")
         if not isinstance(runs, list):
             raise ValidationError("CI runs response must contain workflow_runs")
-        matches.extend(
-            run for run in runs if ci_run_matches(run, tag=tag, sha=commit)
-        )
+        matches.extend(run for run in runs if ci_run_matches(run, tag=tag, sha=commit))
         total_count = document.get("total_count")
         if not isinstance(total_count, int) or total_count < 0:
             raise ValidationError("CI runs response contains an invalid total_count")
@@ -654,9 +650,7 @@ def _verify_checkout_command(
     remote = resolve_remote_tag(api, release_tag)
     if remote.commit_sha != require_full_sha(release_sha):
         raise ValidationError("remote peeled tag SHA changed before checkout verification")
-    metadata = verify_release_checkout(
-        checkout, expected_tag=release_tag, expected_sha=release_sha
-    )
+    metadata = verify_release_checkout(checkout, expected_tag=release_tag, expected_sha=release_sha)
     _write_checkout_outputs(output_path, metadata)
     return metadata
 
@@ -672,9 +666,7 @@ def _pre_push_command(
     remote = resolve_remote_tag(api, release_tag)
     if remote.commit_sha != require_full_sha(release_sha):
         raise ValidationError("remote peeled tag SHA changed before registry login")
-    metadata = verify_release_checkout(
-        checkout, expected_tag=release_tag, expected_sha=release_sha
-    )
+    metadata = verify_release_checkout(checkout, expected_tag=release_tag, expected_sha=release_sha)
     ensure_target_tags_absent(metadata.image_tags, existence)
     return metadata
 
@@ -759,8 +751,7 @@ def main(
                 existence=hub_factory(environment),
             )
             print(
-                f"Pre-push validation passed for {metadata.tag}; "
-                "no target Docker Hub tag exists."
+                f"Pre-push validation passed for {metadata.tag}; no target Docker Hub tag exists."
             )
             return 0
         raise ValidationError("unknown command")

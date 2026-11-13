@@ -138,6 +138,29 @@ If a credential or session may have been exposed, revoke or rotate it first. His
 rewriting does not make a still-valid credential safe. Coordinate history rewriting
 with all repository users and rescan every ref afterward.
 
+## Source-only 0.2.2 maintenance release
+
+`v0.2.2` is a formatting-only source release. It applies Ruff formatting to the release
+validation scripts and release metadata tests so the repository-wide formatting check
+passes on the published source snapshot, and it aligns the project and runtime version
+metadata with `0.2.2`. It changes no runtime behavior, configuration, interface, or
+documented behavior.
+
+No container image is published for `0.2.2`. The recorded `0.2.1` image and its `0.2`,
+`latest`, and `sha-13c5bc7645b9` aliases remain the current image release, the index
+digest above stays unchanged, and Compose instructions and image examples continue to
+reference the published `0.2.1` image. Do not describe a `0.2.2` image as published, do
+not retag an existing image as `0.2.2`, and do not treat the `v0.2.2` tag as container
+provenance.
+
+The Docker release workflow re-validates the remote tag, the checkout version metadata,
+and the absence of every target Docker Hub tag before registry login. `0.2` and `latest`
+are already occupied by the recorded `0.2.1` image, so a `v0.2.2` tag run refuses to
+overwrite or move them and fails pre-push validation instead. That refusal is the
+expected outcome for a source-only release: it is neither a successful image publication
+nor a failure to repair, and the immutable `0.2.1` image tags must not be moved to make
+it pass.
+
 ## Continuous controls
 
 CI has read-only repository permissions, checks out complete history, pins Actions to

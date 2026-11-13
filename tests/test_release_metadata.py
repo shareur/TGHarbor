@@ -12,7 +12,8 @@ import yaml
 import tgharbor
 
 ROOT = Path(__file__).parents[1]
-VERSION = "0.2.1"
+PROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+VERSION = PROJECT["version"]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 GITLEAKS_VERSION = "8.30.1"
 GITLEAKS_LINUX_X64_SHA256 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
@@ -22,14 +23,16 @@ README_USAGE_MAX_BYTES = 64 * 1024
 
 
 def test_final_release_version_and_changelog_are_aligned() -> None:
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert project["version"] == VERSION
+    assert VERSION == "0.2.2"
+    assert PROJECT["version"] == VERSION
     assert tgharbor.__version__ == VERSION
-    # The 0.2.1 release shipped metadata and image updates without a new changelog
-    # entry, so the historical 0.2.0 entry remains the most recent recorded fact.
-    assert "## Unreleased\n\n## 0.2.0 - 2026-11-07" in changelog
+    # The 0.2.1 image release shipped metadata without a changelog entry, so 0.2.2 is
+    # the first recorded entry after the historical 0.2.0 section.
+    assert "## Unreleased\n\n## 0.2.2 - 2026-11-13" in changelog
+    assert "## 0.2.0 - 2026-11-07" in changelog
+    assert changelog.index("## 0.2.2 - 2026-11-13") < changelog.index("## 0.2.0 - 2026-11-07")
     assert ".dev0" not in changelog
 
 
@@ -325,11 +328,7 @@ def test_release_workflow_pins_every_third_party_action_to_full_sha() -> None:
     assert uses.count(CHECKOUT_PIN) == 4
     for action in uses:
         assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action), action
-    for step in (
-        step
-        for job in _release_workflow()["jobs"].values()
-        for step in job["steps"]
-    ):
+    for step in (step for job in _release_workflow()["jobs"].values() for step in job["steps"]):
         if step.get("uses", "").startswith("actions/checkout@"):
             assert step["with"]["persist-credentials"] is False
 
@@ -373,9 +372,7 @@ def test_release_workflow_rechecks_tag_and_collisions_before_login() -> None:
     prepush_index = next(
         index for index, step in enumerate(steps) if "Re-resolve the tag" in step["name"]
     )
-    login_index = next(
-        index for index, step in enumerate(steps) if step.get("uses") == LOGIN_PIN
-    )
+    login_index = next(index for index, step in enumerate(steps) if step.get("uses") == LOGIN_PIN)
     verify_index = next(
         index for index, step in enumerate(steps) if "Verify published" in step["name"]
     )
@@ -421,14 +418,13 @@ def test_published_docker_hub_image_is_documented_in_both_languages() -> None:
         assert "linux/amd64" in text, readme
         assert "linux/arm64" in text, readme
         assert "sha-13c5bc7645b9" in text, readme
-        assert (
-            "sha256:b40996ef4938f8545e5eaee86c91fc57b3d27f9b087353d02a97ae7548c5f560"
-            in text
-        ), readme
+        assert "sha256:b40996ef4938f8545e5eaee86c91fc57b3d27f9b087353d02a97ae7548c5f560" in text, (
+            readme
+        )
 
-    release_security = (
-        ROOT / "docs/3-operations/302-release-security.md"
-    ).read_text(encoding="utf-8")
+    release_security = (ROOT / "docs/3-operations/302-release-security.md").read_text(
+        encoding="utf-8"
+    )
     for token in (
         "v0.2.1",
         "13c5bc7645b9",
@@ -446,9 +442,9 @@ def test_published_docker_hub_image_is_documented_in_both_languages() -> None:
     ):
         assert token in release_security
 
-    operations = (
-        ROOT / "docs/3-operations/301-core-downloader-operations.md"
-    ).read_text(encoding="utf-8")
+    operations = (ROOT / "docs/3-operations/301-core-downloader-operations.md").read_text(
+        encoding="utf-8"
+    )
     assert "docker compose pull" in operations
     assert "docker compose run --rm tgharbor login" in operations
     assert "docker compose up -d" in operations
@@ -501,6 +497,9 @@ def test_active_deployment_docs_use_the_published_image_tag() -> None:
         text = document.read_text(encoding="utf-8")
         assert "shareur/tgharbor:0.2.0" not in text, document
         assert "tgharbor:0.2.0" not in text, document
+        # 0.2.2 is a source-only release; no container image carries that tag, so
+        # active deployment documents must never reference one.
+        assert "tgharbor:0.2.2" not in text, document
 
 
 def _readme_section(path: Path, heading: str) -> str:
@@ -537,9 +536,7 @@ def test_readmes_advertise_save_restricted_media_with_access_boundary() -> None:
 
 def test_feature_overviews_keep_mtproto_save_restriction_access_boundary() -> None:
     english = (ROOT / "docs/0-foundation/002-feature-overview.md").read_text(encoding="utf-8")
-    chinese = (
-        ROOT / "docs/zh-CN/0-foundation/002-feature-overview.md"
-    ).read_text(encoding="utf-8")
+    chinese = (ROOT / "docs/zh-CN/0-foundation/002-feature-overview.md").read_text(encoding="utf-8")
 
     for text, tokens in (
         (english, ("MTProto", "save/forward restricted", "does not grant new access")),
@@ -738,9 +735,7 @@ def test_readme_usage_svg_keeps_both_lanes_and_reduced_motion_safe_animation() -
     assert ".lane-one-highlight" in animated_css
     assert ".lane-two-highlight" in animated_css
 
-    animation_declarations = re.compile(
-        r"(?:^|[{;\s])animation(?:-[a-z-]+)?\s*:", re.IGNORECASE
-    )
+    animation_declarations = re.compile(r"(?:^|[{;\s])animation(?:-[a-z-]+)?\s*:", re.IGNORECASE)
     declarations = list(animation_declarations.finditer(style_text))
     assert declarations, "animation declarations must exist"
     for declaration in declarations:
@@ -756,9 +751,7 @@ def test_readme_usage_svg_keeps_both_lanes_and_reduced_motion_safe_animation() -
     )
     assert not forbidden_motion.search(animated_css), "motion must be opacity-only"
 
-    keyframe_headers = list(
-        re.finditer(r"@keyframes\s+[\w-]+\s*\{", animated_css, re.IGNORECASE)
-    )
+    keyframe_headers = list(re.finditer(r"@keyframes\s+[\w-]+\s*\{", animated_css, re.IGNORECASE))
     assert len(keyframe_headers) >= 4
     for keyframe in keyframe_headers:
         open_brace = keyframe.end() - 1

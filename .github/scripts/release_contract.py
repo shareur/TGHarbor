@@ -86,9 +86,7 @@ def parse_stable_tag(value: object) -> SemVer:
         raise ContractError("release tag must be a string")
     match = STABLE_TAG_PATTERN.fullmatch(value)
     if match is None:
-        raise ContractError(
-            "release tag must be a stable annotated tag in vMAJOR.MINOR.PATCH form"
-        )
+        raise ContractError("release tag must be a stable annotated tag in vMAJOR.MINOR.PATCH form")
     major, minor, patch = (int(component) for component in match.groups())
     return SemVer(major=major, minor=minor, patch=patch)
 

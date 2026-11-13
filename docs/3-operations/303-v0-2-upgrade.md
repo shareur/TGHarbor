@@ -4,6 +4,8 @@
 
 v0.2 upgrades SQLite schema 1 to 2 and moves tracked completed v0.1 UUID-directory
 outputs into the shared Inbox. Rehearse this procedure on copies before production.
+Version `0.2.2` is a formatting-only source release; the current container image remains
+the recorded `0.2.1` publication.
 
 ## Before upgrade
 
@@ -11,11 +13,15 @@ outputs into the shared Inbox. Rehearse this procedure on copies before producti
 2. Back up the SQLite database and sidecars, Telegram sessions, configuration, and the
    complete download root while preserving ownership and permissions.
 3. Keep the database and download-root backups as one restore point.
-4. Install version `0.2.1` in an isolated environment and scan the release/image. For
-   a container upgrade, pull `shareur/tgharbor:0.2.1` from
+4. For a source installation, install version `0.2.2` in an isolated environment and
+   scan the built artifacts. `0.2.2` is a formatting-only source release with no
+   container image, so it changes no runtime behavior and adds no migration step beyond
+   the schema 1-to-2 upgrade described here.
+5. For a container upgrade, pull `shareur/tgharbor:0.2.1` from
    [Docker Hub](https://hub.docker.com/r/shareur/tgharbor), verify that it resolves to
    the recorded candidate digest, and confirm that its OCI revision label is the exact
-   candidate commit; the tag alone is not provenance.
+   candidate commit; the tag alone is not provenance. Container deployment stays on the
+   recorded `0.2.1` image because no `0.2.2` image is published.
 
 ## Rehearsal
 
