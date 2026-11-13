@@ -1,0 +1,34 @@
+services:
+  tgharbor:
+    image: shareur/tgharbor:0.2.1
+    container_name: tgharbor
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TGHARBOR_CONFIG: /config/config.yaml
+      TGHARBOR_DATABASE_PATH: /data/tgharbor.db
+      TGHARBOR_SESSIONS_PATH: /data/sessions
+      TGHARBOR_DOWNLOADS_PATH: /downloads
+    volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /config/config.yaml
+        read_only: true
+      - type: volume
+        source: tgharbor_data
+        target: /data
+      - type: volume
+        source: tgharbor_downloads
+        target: /downloads
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+# These are project-scoped Docker-managed volumes. Operators who need host bind
+# mounts can replace the two volume entries in their ignored local compose.yaml.
+volumes:
+  tgharbor_data:
+  tgharbor_downloads:

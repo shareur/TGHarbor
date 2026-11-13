@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360" role="img" aria-labelledby="title desc" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+  <title id="title">TGHarbor intake workflow</title>
+  <desc id="desc">Two neutral intake paths. Lane one: a media message named video.mp4 is forwarded to TGHarbor Bot and shows an accepted request check. Lane two: a media message that cannot be forwarded is handled by copying its single https://t.me message link and sending only that link to TGHarbor Bot, which also shows an accepted request check. The checks mean request acceptance only, not a completed download or archive.</desc>
+  <style>
+    .panel { fill: #0b1220; stroke: #253752; }
+    .lane { fill: #111d31; stroke: #2b405f; }
+    .card { fill: #182842; stroke: #355176; }
+    .ok-card { fill: #123b2b; stroke: #6ee7a8; }
+    .link-chip { fill: #2b2450; stroke: #b79cff; }
+    .soft-accent { fill: #173a5e; }
+    .soft-accent2 { fill: #2b2450; }
+    .soft-ok { fill: #123b2b; }
+    .soft-warn { fill: #3b1f2a; }
+    .ink { fill: #f3f7fd; }
+    .muted { fill: #a9b9d2; }
+    .accent-ink { fill: #64b5ff; }
+    .accent2-ink { fill: #b79cff; }
+    .ok-ink { fill: #6ee7a8; }
+    .warn-ink { fill: #ff9aa8; }
+    .accent-line { stroke: #64b5ff; }
+    .accent2-line { stroke: #b79cff; }
+    .ok-line { stroke: #6ee7a8; }
+    .check-mark { stroke: #ffffff; }
+    .warn-line { stroke: #ff9aa8; }
+    .connector { stroke: #a9b9d2; }
+    .label { font-size: 16px; font-weight: 650; }
+    .small { font-size: 10px; font-weight: 600; letter-spacing: 0.4px; }
+    .link-text { font-size: 13px; font-weight: 600; }
+    .ok-text { font-size: 16px; font-weight: 700; }
+    .lane-highlight { fill: #ffffff; opacity: 0; }
+    .check-halo { fill: none; opacity: 0; }
+    @media (prefers-color-scheme: light) {
+      .panel { fill: #f4f7fb; stroke: #c7d5e6; }
+      .lane { fill: #eaf1f9; stroke: #c2d2e4; }
+      .card { fill: #ffffff; stroke: #b7c9dd; }
+      .ok-card { fill: #dcf7e9; stroke: #127a4a; }
+      .link-chip { fill: #eee8ff; stroke: #6d4bd1; }
+      .soft-accent { fill: #dbeafe; }
+      .soft-accent2 { fill: #eee8ff; }
+      .soft-ok { fill: #dcf7e9; }
+      .soft-warn { fill: #fde2e7; }
+      .ink { fill: #172033; }
+      .muted { fill: #4b5d73; }
+      .accent-ink { fill: #1769d2; }
+      .accent2-ink { fill: #6d4bd1; }
+      .ok-ink { fill: #127a4a; }
+      .warn-ink { fill: #b4233a; }
+      .accent-line { stroke: #1769d2; }
+      .accent2-line { stroke: #6d4bd1; }
+      .ok-line { stroke: #127a4a; }
+      .check-mark { stroke: #064e3b; }
+      .warn-line { stroke: #b4233a; }
+      .connector { stroke: #4b5d73; }
+      .lane-highlight { fill: #0b1220; }
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .lane-one-highlight { animation: lane-one 8s ease-in-out infinite; }
+      .lane-two-highlight { animation: lane-two 8s ease-in-out infinite; }
+      .lane-one-check { animation: check-one 8s ease-in-out infinite; }
+      .lane-two-check { animation: check-two 8s ease-in-out infinite; }
+      @keyframes lane-one {
+        0%, 4% { opacity: 0; }
+        10%, 32% { opacity: 0.1; }
+        42%, 100% { opacity: 0; }
+      }
+      @keyframes check-one {
+        0%, 28% { opacity: 0; }
+        34%, 40% { opacity: 0.55; }
+        48%, 100% { opacity: 0; }
+      }
+      @keyframes lane-two {
+        0%, 52% { opacity: 0; }
+        58%, 78% { opacity: 0.1; }
+        88%, 100% { opacity: 0; }
+      }
+      @keyframes check-two {
+        0%, 74% { opacity: 0; }
+        80%, 86% { opacity: 0.55; }
+        94%, 100% { opacity: 0; }
+      }
+    }
+  </style>
+
+  <rect class="panel" x="10" y="10" width="940" height="340" rx="22" stroke-width="1.5"/>
+
+  <g id="lane-one">
+    <rect class="lane" x="30" y="30" width="900" height="140" rx="18" stroke-width="1.5"/>
+    <rect class="lane-highlight lane-one-highlight" x="34" y="34" width="892" height="132" rx="14"/>
+
+    <rect class="card" x="48" y="58" width="184" height="84" rx="14" stroke-width="1.5"/>
+    <circle class="soft-accent" cx="84" cy="100" r="20"/>
+    <path class="accent-ink" d="M79 90 L96 100 L79 110 Z"/>
+    <text class="ink label" x="112" y="97">video.mp4</text>
+    <rect class="soft-accent" x="112" y="108" width="44" height="18" rx="9"/>
+    <text class="muted small" x="134" y="121" text-anchor="middle">MP4</text>
+
+    <circle class="soft-accent accent-line" cx="340" cy="100" r="28" stroke-width="2"/>
+    <path class="accent-line" d="M328 100 H350" stroke-width="4" stroke-linecap="round"/>
+    <path class="accent-line" d="M344 92 L354 100 L344 108" fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <rect class="card" x="448" y="58" width="184" height="84" rx="14" stroke-width="1.5"/>
+    <rect class="soft-accent accent-line" x="468" y="82" width="36" height="32" rx="10" stroke-width="2"/>
+    <line class="accent-line" x1="486" y1="82" x2="486" y2="74" stroke-width="3" stroke-linecap="round"/>
+    <circle class="accent-ink" cx="486" cy="71" r="3"/>
+    <circle class="accent-ink" cx="478" cy="97" r="3"/>
+    <circle class="accent-ink" cx="494" cy="97" r="3"/>
+    <path class="accent-line" d="M479 105 H493" stroke-width="2.5" stroke-linecap="round"/>
+    <text class="ink label" x="516" y="105">TGHarbor Bot</text>
+
+    <path class="connector" d="M636 100 H664" stroke-width="3" stroke-linecap="round"/>
+    <path class="connector" d="M658 92 L668 100 L658 108" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <rect class="ok-card" x="684" y="58" width="216" height="84" rx="14" stroke-width="1.5"/>
+    <circle class="soft-ok" cx="722" cy="100" r="24"/>
+    <circle class="ok-line" cx="722" cy="100" r="20" fill="none" stroke-width="1.5"/>
+    <path id="lane-one-check-mark" class="check-mark" d="M712 100 L719 107 L733 91" fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="ok-ink ok-text" x="756" y="106">OK</text>
+    <circle class="check-halo lane-one-check ok-line" cx="722" cy="100" r="28" stroke-width="3"/>
+  </g>
+
+  <g id="lane-two">
+    <rect class="lane" x="30" y="190" width="900" height="140" rx="18" stroke-width="1.5"/>
+    <rect class="lane-highlight lane-two-highlight" x="34" y="194" width="892" height="132" rx="14"/>
+
+    <rect class="card" x="48" y="218" width="184" height="84" rx="14" stroke-width="1.5"/>
+    <circle class="soft-accent" cx="84" cy="260" r="20"/>
+    <path class="accent-ink" d="M79 250 L96 260 L79 270 Z"/>
+    <text class="ink label" x="112" y="257">video.mp4</text>
+    <rect class="soft-accent" x="112" y="268" width="44" height="18" rx="9"/>
+    <text class="muted small" x="134" y="281" text-anchor="middle">MP4</text>
+
+    <circle class="soft-warn warn-line" cx="210" cy="282" r="13" stroke-width="1.5"/>
+    <path class="warn-line" d="M201 286 H215" stroke-width="2.5" stroke-linecap="round"/>
+    <path class="warn-line" d="M211 280 L218 286 L211 292" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path class="warn-line" d="M200 292 L220 272" stroke-width="3" stroke-linecap="round"/>
+
+    <rect class="link-chip" x="252" y="226" width="176" height="68" rx="12" stroke-width="1.5"/>
+    <rect class="accent2-line" x="266" y="246" width="12" height="14" rx="2" fill="none" stroke-width="2"/>
+    <rect class="soft-accent2 accent2-line" x="270" y="242" width="12" height="14" rx="2" stroke-width="2"/>
+    <text class="accent2-ink link-text" x="290" y="265">https://t.me/&#8230;/42</text>
+
+    <rect class="card" x="448" y="218" width="184" height="84" rx="14" stroke-width="1.5"/>
+    <rect class="soft-accent accent-line" x="468" y="242" width="36" height="32" rx="10" stroke-width="2"/>
+    <line class="accent-line" x1="486" y1="242" x2="486" y2="234" stroke-width="3" stroke-linecap="round"/>
+    <circle class="accent-ink" cx="486" cy="231" r="3"/>
+    <circle class="accent-ink" cx="478" cy="257" r="3"/>
+    <circle class="accent-ink" cx="494" cy="257" r="3"/>
+    <path class="accent-line" d="M479 265 H493" stroke-width="2.5" stroke-linecap="round"/>
+    <text class="ink label" x="516" y="265">TGHarbor Bot</text>
+
+    <path class="connector" d="M636 260 H664" stroke-width="3" stroke-linecap="round"/>
+    <path class="connector" d="M658 252 L668 260 L658 268" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <rect class="ok-card" x="684" y="218" width="216" height="84" rx="14" stroke-width="1.5"/>
+    <circle class="soft-ok" cx="722" cy="260" r="24"/>
+    <circle class="ok-line" cx="722" cy="260" r="20" fill="none" stroke-width="1.5"/>
+    <path id="lane-two-check-mark" class="check-mark" d="M712 260 L719 267 L733 251" fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="ok-ink ok-text" x="756" y="266">OK</text>
+    <circle class="check-halo lane-two-check ok-line" cx="722" cy="260" r="28" stroke-width="3"/>
+  </g>
+</svg>

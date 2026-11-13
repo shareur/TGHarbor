@@ -1,0 +1,159 @@
+name: Docker Hub release
+
+on:
+    workflow_run:
+        workflows: ["CI"]
+        types: [completed]
+    workflow_dispatch:
+        inputs:
+            release_tag:
+                description: Existing annotated stable release tag, for example v0.2.0
+                required: true
+                type: string
+
+permissions:
+    contents: read
+    actions: read
+
+concurrency:
+    group: shareur/tgharbor
+    cancel-in-progress: false
+
+jobs:
+    validate:
+        name: Validate release request
+        if: >-
+            github.event_name == 'workflow_dispatch' ||
+            (github.event_name == 'workflow_run' &&
+            github.event.workflow_run.event == 'push' &&
+            github.event.workflow_run.conclusion == 'success')
+        runs-on: ubuntu-latest
+        outputs:
+            release_tag: ${{ steps.resolve.outputs.release_tag }}
+            release_sha: ${{ steps.resolve.outputs.release_sha }}
+            release_version: ${{ steps.resolve.outputs.release_version }}
+            minor_tag: ${{ steps.resolve.outputs.minor_tag }}
+            latest_tag: ${{ steps.resolve.outputs.latest_tag }}
+            sha_tag: ${{ steps.resolve.outputs.sha_tag }}
+            image_created: ${{ steps.verify.outputs.image_created }}
+            image_source: ${{ steps.verify.outputs.image_source }}
+        steps:
+            - name: Check out workflow source from the protected default branch
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  ref: refs/heads/master
+                  path: workflow-source
+                  fetch-depth: 1
+                  persist-credentials: false
+            - name: Validate event, tag, exact CI workflow run, and default-branch reachability
+              id: resolve
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  python workflow-source/.github/scripts/validate_docker_release.py resolve \
+                    --event "$GITHUB_EVENT_NAME" \
+                    --event-path "$GITHUB_EVENT_PATH" \
+                    --repository "$GITHUB_REPOSITORY" \
+                    --ref "$GITHUB_REF" \
+                    --output "$GITHUB_OUTPUT"
+            - name: Check out the exact tag commit, never the workflow HEAD
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  ref: refs/tags/${{ steps.resolve.outputs.release_tag }}
+                  path: release
+                  fetch-depth: 1
+                  persist-credentials: false
+            - name: Bind tag, project version, runtime version, and timestamp
+              id: verify
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+                  RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+                  RELEASE_SHA: ${{ steps.resolve.outputs.release_sha }}
+              run: |
+                  set -euo pipefail
+                  python workflow-source/.github/scripts/validate_docker_release.py verify-checkout \
+                    --checkout release \
+                    --release-tag "$RELEASE_TAG" \
+                    --release-sha "$RELEASE_SHA" \
+                    --output "$GITHUB_OUTPUT"
+
+    publish:
+        name: Publish and verify Docker Hub release
+        needs: validate
+        runs-on: ubuntu-latest
+        environment: dockerhub-release
+        steps:
+            - name: Check out workflow source from the protected default branch
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  ref: refs/heads/master
+                  path: workflow-source
+                  fetch-depth: 1
+                  persist-credentials: false
+            - name: Check out the exact tag commit for independent version checks
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  ref: refs/tags/${{ needs.validate.outputs.release_tag }}
+                  path: release
+                  fetch-depth: 1
+                  persist-credentials: false
+            - name: Set up QEMU for linux/arm64 smoke tests
+              uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+            - name: Re-resolve the tag and reject existing target tags before login
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+                  RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+                  RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
+              run: |
+                  set -euo pipefail
+                  python workflow-source/.github/scripts/validate_docker_release.py pre-push \
+                    --checkout release \
+                    --release-tag "$RELEASE_TAG" \
+                    --release-sha "$RELEASE_SHA"
+            - name: Log in to Docker Hub with environment-scoped secrets
+              uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+            - name: Build and push the multi-platform release
+              id: build
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+              with:
+                  context: https://github.com/shareur/TGHarbor.git#refs/tags/${{ needs.validate.outputs.release_tag }}
+                  file: Dockerfile
+                  platforms: linux/amd64,linux/arm64
+                  push: true
+                  tags: |
+                      shareur/tgharbor:${{ needs.validate.outputs.release_version }}
+                      shareur/tgharbor:${{ needs.validate.outputs.minor_tag }}
+                      shareur/tgharbor:latest
+                      shareur/tgharbor:${{ needs.validate.outputs.sha_tag }}
+                  build-args: |
+                      TGHARBOR_IMAGE_VERSION=${{ needs.validate.outputs.release_version }}
+                      TGHARBOR_IMAGE_REVISION=${{ needs.validate.outputs.release_sha }}
+                      TGHARBOR_IMAGE_SOURCE=https://github.com/shareur/TGHarbor
+                      TGHARBOR_IMAGE_CREATED=${{ needs.validate.outputs.image_created }}
+                  provenance: mode=max
+                  sbom: true
+            - name: Verify published digests, attestations, labels, and runtimes
+              env:
+                  RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+                  RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+                  RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
+                  IMAGE_CREATED: ${{ needs.validate.outputs.image_created }}
+                  IMAGE_SOURCE: ${{ needs.validate.outputs.image_source }}
+                  BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  python workflow-source/.github/scripts/verify_docker_release.py \
+                    --release-tag "$RELEASE_TAG" \
+                    --release-version "$RELEASE_VERSION" \
+                    --release-sha "$RELEASE_SHA" \
+                    --image-created "$IMAGE_CREATED" \
+                    --image-source "$IMAGE_SOURCE" \
+                    --expected-digest "$BUILD_DIGEST" \
+                    --output "$GITHUB_OUTPUT" \
+                    --summary "$GITHUB_STEP_SUMMARY"

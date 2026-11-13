@@ -1,0 +1,10 @@
+# Deny the entire build context by default, then allowlist only the inputs the
+# Dockerfile needs. Keeping this an allowlist prevents unpublished or untracked
+# material from entering the image build context.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!hatch_build.py
+!src
+!src/**
