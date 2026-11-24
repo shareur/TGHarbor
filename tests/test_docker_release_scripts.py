@@ -1739,6 +1739,85 @@ def test_history_scan_rejects_actual_payload_paths_and_sensitive_values(entry: s
         verify.assert_history_has_no_project_payload([{"created_by": entry}])
 
 
+# Observed ``created_by`` shapes of the upstream ``python:3.15-slim`` build layer an
+# image inherits. The backslashes are shell, linker, and printf escapes rather than
+# project payload paths, so the history scan must accept them while still rejecting a
+# payload name that appears anywhere in the same command text.
+UPSTREAM_BASE_IMAGE_CREATED_BY = (
+    (
+        r"""/bin/sh -c set -eux; LDFLAGS="${LDFLAGS:-} """
+        r"""-Wl,-rpath='\$\$ORIGIN/../lib'" ./configure --enable-shared """
+        r"""--enable-optimizations; make -j"$(nproc)" """
+    ),
+    r"""/bin/sh -c printf "*%s\n" "$(cat /usr/local/lib/python3.15/Setup.local)" | sort""",
+    r"""/bin/sh -c awk 'BEGIN { printf "*%s\n", $0 }' /usr/local/lib/python3.15/README.rst""",
+    r"""/bin/sh -c printf '\n' > /usr/local/lib/python3.15/site-packages/.keep""",
+    r"""/bin/sh -c find /usr/local/lib/python3.15 -type f \( -name '*.pyc' \) -delete""",
+)
+
+
+def test_upstream_base_image_history_fixture_matches_observed_patterns() -> None:
+    joined = "\n".join(UPSTREAM_BASE_IMAGE_CREATED_BY)
+    assert r"-Wl,-rpath='\$\$ORIGIN/../lib'" in joined
+    assert r'printf "*%s\n"' in joined
+    # The fixture must reach the escape analysis: these tokens keep a backslash
+    # after tokenization, which the previous blanket rejection refused outright.
+    retained = [
+        token
+        for entry in UPSTREAM_BASE_IMAGE_CREATED_BY
+        for token in verify._history_tokens(entry)
+        if "\\" in token and not token.startswith("-")
+    ]
+    assert retained
+
+
+@pytest.mark.parametrize("entry", UPSTREAM_BASE_IMAGE_CREATED_BY)
+def test_history_scan_accepts_upstream_base_image_escape_commands(entry: str) -> None:
+    assert verify.assert_history_has_no_project_payload([{"created_by": entry}]) is None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        r'COPY ".env\backup" /app/',
+        r'COPY "tests\unit.py" /app/',
+        r'COPY "..\..\etc" /app/',
+        r'COPY "C:\Users\Public\state.session" /app/',
+        r'COPY "\\server\share\config.yaml" /app/',
+        r'RUN cp "app\restricted\tree" /app/',
+        r'RUN cp "app\bin\.env" /app/',
+        r'RUN cp ".git\config" /app/',
+        r'RUN cp "app\main.py\state.session" /app/',
+        r'RUN sha256sum "%s\tests" /app/',
+        # Unbalanced quoting forces the whitespace fallback tokenizer, which retains
+        # raw backslashes instead of letting ``shlex`` consume them.
+        r"""COPY '.env\backup /app/""",
+        r"""RUN cp '..\..\etc /app/""",
+    ],
+)
+def test_history_scan_rejects_backslash_path_payloads(entry: str) -> None:
+    with pytest.raises(verify.VerificationError):
+        verify.assert_history_has_no_project_payload([{"created_by": entry}])
+
+
+def test_history_scan_rejects_payloads_beside_legitimate_escape_syntax() -> None:
+    for entry in (
+        r'RUN printf "%s\n" ".env\backup"',
+        r'RUN printf "%s\n" .env',
+        r'RUN printf "%s\n" config.yaml',
+        r'RUN printf "%s\n" && cp .env /app/.env',
+    ):
+        with pytest.raises(verify.VerificationError):
+            verify.assert_history_has_no_project_payload([{"created_by": entry}])
+
+
+def test_history_scan_rejects_url_with_embedded_credentials() -> None:
+    with pytest.raises(verify.VerificationError):
+        verify.assert_history_has_no_project_payload(
+            [{"created_by": "ARG TGHARBOR_SOURCE=https://user:secret@github.com/shareur/TGHarbor"}]
+        )
+
+
 def test_history_scan_applies_to_comment_and_author_fields() -> None:
     for key in ("comment", "author"):
         with pytest.raises(verify.VerificationError):

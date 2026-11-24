@@ -28,6 +28,13 @@ This project follows a Keep a Changelog style while it remains pre-1.0.
   `TGHARBOR_CONFIG=/config/config.yaml` is allowed while copied secrets, configuration
   files, tests, Git material, sessions, databases, logs, and sensitive environment
   values remain rejected.
+- The history scan now distinguishes shell, linker, and printf escape syntax from path
+  separators within a command word, so upstream base-image commands such as
+  `-Wl,-rpath='\$\$ORIGIN/../lib'` and `printf "*%s\n"` no longer fail verification.
+  Windows drive and UNC roots, unescaped backslash separators, forbidden payload names
+  and suffixes, and URLs with embedded credentials remain rejected, and every other
+  word in the same command is still checked. Layer archive scanning remains the
+  authoritative actual-member control.
 - Layer scanning accepts only the canonical tar root directory marker `.` with
   directory metadata and rejects non-directory or duplicate root markers, unsafe link
   or device metadata, and dot components that would bypass normalization, forbidden

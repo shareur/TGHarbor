@@ -201,9 +201,13 @@ multiple source entries, wrong URIs or revisions, malformed structures, mixed le
 `configSource` paths, and source or revision strings that appear only in build arguments
 or internal parameters. Record the image digest with the label values, then run the
 final-filesystem, configuration/history, and per-layer scans. The history scan is
-path-aware: a runtime mount default such as `TGHARBOR_CONFIG=/config/config.yaml` is not
-a copied payload, while a copied `.env`, configuration file, test, Git, session,
-database, or log artifact remains forbidden. The layer scan accepts only the canonical
+path-aware and command-context-aware: a runtime mount default such as
+`TGHARBOR_CONFIG=/config/config.yaml` is not a copied payload, and shell, linker, or
+printf escape syntax inherited from an upstream base image, such as
+`-Wl,-rpath='\$\$ORIGIN/../lib'` or `printf "*%s\n"`, is not a path separator. A copied
+`.env`, configuration file, test, Git, session, database, or log artifact, a Windows
+drive or UNC root, an unescaped backslash separator, and a URL with embedded credentials
+remain forbidden. The layer scan accepts only the canonical
 tar root directory marker `.`, requires directory metadata, rejects unsafe link or
 device metadata, and applies normalization, forbidden-name, traversal, absolute,
 backslash, link-target, and duplicate checks to every other member.

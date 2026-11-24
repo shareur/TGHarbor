@@ -141,6 +141,28 @@ SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"(?i)(?:api[_-]?hash|bot[_-]?token|password|secret|token)\s*[=:]\s*\S+"),
 )
 HISTORY_EXCLUDED_DIRECTORY_NAMES = frozenset({".git", "tests"})
+# Shell, printf, and linker arguments record a backslash as an escape
+# introducer rather than as a path separator. Upstream base-image layers
+# legitimately carry such commands, for example
+# ``LDFLAGS="${LDFLAGS:-} -Wl,-rpath='\$\$ORIGIN/../lib'"`` or
+# ``printf "*%s\n"``. Recognizing exactly those sequences keeps escape
+# syntax out of the path checks, while a Windows drive or UNC root and any
+# unescaped backslash remain ambiguous path syntax and still fail closed.
+HISTORY_ESCAPE_PATTERN = re.compile(
+    r"""\\(?:[0-7]{1,3}|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}"""
+    r"""|['"$`\\ ;(){}\[\]!*?#~|&<>])"""
+)
+HISTORY_TRAILING_LETTER_ESCAPE_PATTERN = re.compile(r"\\[abefnrtv]$")
+# A word may retain only a dangling backslash after surrounding punctuation is
+# trimmed, which is a shell line continuation or the escaped form of ``\(``,
+# ``\)`` or ``\;``. The path checks below still see the separator form.
+HISTORY_TRAILING_BACKSLASH_PATTERN = re.compile(r"\\$")
+HISTORY_PRINTF_LETTER_ESCAPE_PATTERN = re.compile(r"\\[abefnrtv]")
+HISTORY_PRINTF_CONVERSION_PATTERN = re.compile(
+    r"%[-+ #0]*(?:[0-9]+|\*)?(?:\.(?:[0-9]+|\*))?(?:hh|h|ll|l|j|z|t|L)?"
+    r"[diouxXeEfFgGaAcspn%]"
+)
+URL_WITH_CREDENTIALS_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@")
 
 REQUIRED_LABELS = {
     "org.opencontainers.image.title": "TGHarbor",
@@ -469,22 +491,57 @@ def _history_tokens(command: str) -> list[str]:
     return [token for token in tokens if token and not token.startswith("#")]
 
 
-def _history_path_problem(value: str, *, allow_runtime_mounts: bool) -> str | None:
-    """Return a payload reason for one history path token.
+def _history_escape_free(word: str) -> str:
+    """Remove recognized shell, linker, and printf escapes from one word.
 
-    The check is path-aware rather than substring-based: the legitimate runtime
-    default ``TGHARBOR_CONFIG=/config/config.yaml`` is a mount path, while a
-    copied ``.env``, ``config.yaml``, test, Git, session, database, or log path
-    remains a forbidden payload.
+    Letter escapes such as ``\n`` are ambiguous with a Windows separator, so
+    they are removed only when the word is a printf format (it carries a
+    conversion such as ``%s``) or when the escape closes the word. Numeric,
+    shell-punctuation, and dangling trailing escapes are removed
+    unconditionally because no path component is spelled that way.
     """
 
-    candidate = value.strip().strip("\"'`()[]{};,")
+    residue = HISTORY_TRAILING_BACKSLASH_PATTERN.sub("", word)
+    residue = HISTORY_ESCAPE_PATTERN.sub("", residue)
+    residue = HISTORY_TRAILING_LETTER_ESCAPE_PATTERN.sub("", residue)
+    if HISTORY_PRINTF_CONVERSION_PATTERN.search(word) is not None:
+        residue = HISTORY_PRINTF_LETTER_ESCAPE_PATTERN.sub("", residue)
+    return residue
+
+
+def _history_backslash_problem(word: str) -> str | None:
+    """Return a reason when one word uses a backslash as path syntax.
+
+    A Windows drive or UNC root is absolute path syntax, and any backslash
+    that is not a recognized shell, linker, or printf escape is an ambiguous
+    separator. Escape-only words remain path candidates for the checks below,
+    so the escape allowance cannot exempt a forbidden component.
+    """
+
+    if word.startswith("\\\\"):
+        return "history path is an ambiguous absolute path"
+    if "\\" in _history_escape_free(word):
+        return "history path contains an ambiguous backslash"
+    return None
+
+
+def _history_word_problem(word: str, *, allow_runtime_mounts: bool) -> str | None:
+    """Return a payload reason for one whitespace-delimited history word."""
+
+    candidate = word.strip().strip("\"'`()[]{};,")
     if not candidate or candidate.startswith(("-", "#")):
         return None
+    if URL_WITH_CREDENTIALS_PATTERN.search(candidate) is not None:
+        return "history references a URL with embedded credentials"
     if "://" in candidate and not candidate.startswith(("/", "./", "../")):
         return None
+    if WINDOWS_DRIVE_PATTERN.match(candidate) is not None:
+        return "history path is an ambiguous absolute path"
     if "\\" in candidate:
-        return "history path contains an ambiguous backslash"
+        problem = _history_backslash_problem(candidate)
+        if problem is not None:
+            return problem
+        candidate = candidate.replace("\\", "/")
     normalized = candidate
     while normalized.startswith("./"):
         normalized = normalized[2:]
@@ -518,6 +575,25 @@ def _history_path_problem(value: str, *, allow_runtime_mounts: bool) -> str | No
         return "history references a restricted, configuration, or development file"
     if basename.endswith(FORBIDDEN_SUFFIXES):
         return "history references a user-state file suffix"
+    return None
+
+
+def _history_path_problem(value: str, *, allow_runtime_mounts: bool) -> str | None:
+    """Return a payload reason for a history path or command fragment.
+
+    The fragment is evaluated word by word so that shell quoting which groups
+    an option with an escaped linker argument keeps its option context, and so
+    that a printed format string cannot exempt a different word in the same
+    fragment. The check is path-aware rather than substring-based: the
+    legitimate runtime default ``TGHARBOR_CONFIG=/config/config.yaml`` is a
+    mount path, while a copied ``.env``, ``config.yaml``, test, Git, session,
+    database, or log path remains a forbidden payload.
+    """
+
+    for word in value.split():
+        problem = _history_word_problem(word, allow_runtime_mounts=allow_runtime_mounts)
+        if problem is not None:
+            return problem
     return None
 
 
