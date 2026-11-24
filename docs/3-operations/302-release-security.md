@@ -141,14 +141,18 @@ an immutable tag, and do not re-run a workflow that would push a second image.
 
 The tracked `Docker image verification` workflow
 (`.github/workflows/docker-verify.yml`) is manually dispatchable for a stable tag. It has
-read-only repository permissions, no Docker Hub secrets or environment, and no registry
-login. It resolves the public annotated tag and peeled commit, proves reachability from
-the protected default branch, checks out the verifier source from that exact
-default-branch commit in a credential-free step, and checks out the exact tagged commit
-for version metadata. It then discovers the immutable index digest anonymously from the
-version tag and requires the derived minor, `latest`, and `sha-*` aliases to converge to
-the same digest. An optional expected digest input pins the exact existing identity and
-fails closed on a mismatch.
+only `contents: read` repository permission, no Docker Hub secrets or environment, and no
+registry login. It passes the ephemeral read-only GitHub token to the two metadata steps
+only, through the environment, so tag and default-branch resolution works against a
+private repository without anonymous REST failures. The token is used only for GitHub
+metadata reads through the canonical GitHub REST API and is never sent to Docker Hub, a
+registry, a Git remote, command arguments, summaries, or the image runtime. The workflow
+resolves the annotated tag and peeled commit, proves reachability from the protected
+default branch, checks out the verifier source from that exact default-branch commit, and
+checks out the exact tagged commit for version metadata. It then discovers the immutable
+index digest anonymously from the version tag and requires the derived minor, `latest`,
+and `sha-*` aliases to converge to the same digest. An optional expected digest input pins
+the exact existing identity and fails closed on a mismatch.
 
 After discovery, the workflow runs only existing-image verification: OCI labels,
 structural provenance, SBOM, layer and static checks, and the hardened Docker runtime
@@ -158,7 +162,9 @@ check. A successful verification run establishes only that the already published
 matches the corrected checks. It does not retroactively turn a failed publication into a
 successful release, replace a production restore-point backup, or authorize deployment.
 The `verify-existing` mode in the release contract provides the same discovery and
-verification path locally; it sends no credentials.
+verification path locally. It reads GitHub metadata anonymously unless a read-only
+GitHub token is present in the environment, and it always discovers and verifies the
+registry image anonymously with no registry credentials.
 
 Build the release image from the clean immutable candidate. The workflow build context
 is the already validated full commit SHA, not the mutable release tag ref; tag

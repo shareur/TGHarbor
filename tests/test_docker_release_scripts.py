@@ -2268,9 +2268,173 @@ def test_verify_existing_command_fails_closed_on_identity_or_digest_mismatch(
         )
 
 
-def test_existing_modes_use_a_credential_free_github_api() -> None:
-    api = validate._anonymous_api_from_environment({"GITHUB_TOKEN": "not-used"})
-    assert api._token is None
+def test_existing_modes_use_the_environment_github_api_factory() -> None:
+    authenticated = validate._api_from_environment({"GITHUB_TOKEN": "ephemeral-read-only-token"})
+    anonymous = validate._api_from_environment({})
+    assert authenticated._token == "ephemeral-read-only-token"
+    assert anonymous._token is None
+
+
+def test_resolve_existing_main_passes_the_token_to_the_metadata_api(tmp_path: Path) -> None:
+    token = "ephemeral-read-only-token"
+    captured: dict[str, str] = {}
+
+    def factory(environ: dict[str, str]) -> FakeGitHub:
+        captured.update(environ)
+        return FakeGitHub({**remote_mapping(), **reachability_mapping()})
+
+    output = tmp_path / "output"
+    status = validate.main(
+        ["resolve-existing", "--release-tag", TAG, "--output", str(output)],
+        environ={"GITHUB_TOKEN": token},
+        api_factory=factory,
+    )
+    assert status == 0
+    assert captured["GITHUB_TOKEN"] == token
+    assert token not in output.read_text(encoding="utf-8")
+
+
+def test_verify_existing_main_passes_the_token_to_the_metadata_api(tmp_path: Path) -> None:
+    token = "ephemeral-read-only-token"
+    repo = tmp_path / "release"
+    repo.mkdir()
+    sha = _make_release_repo(repo)
+    metadata = validate.verify_release_checkout(repo, expected_tag=TAG, expected_sha=sha)
+    graph = release_graph(metadata)
+    captured: dict[str, str] = {}
+
+    def factory(environ: dict[str, str]) -> FakeGitHub:
+        captured.update(environ)
+        return FakeGitHub({**remote_mapping(commit=sha), **reachability_mapping_for(sha)})
+
+    output = tmp_path / "output"
+    status = validate.main(
+        [
+            "verify-existing",
+            "--checkout",
+            str(repo),
+            "--release-tag",
+            TAG,
+            "--release-sha",
+            sha,
+            "--expected-digest",
+            INDEX_DIGEST,
+            "--output",
+            str(output),
+            "--retry-attempts",
+            "1",
+            "--retry-delay",
+            "0",
+        ],
+        environ={"GITHUB_TOKEN": token},
+        api_factory=factory,
+        image_registry_factory=lambda _environ: FakeRegistry(graph),
+    )
+    assert status == 0
+    assert captured["GITHUB_TOKEN"] == token
+    assert token not in output.read_text(encoding="utf-8")
+
+
+def test_github_api_authenticates_only_canonical_metadata_requests() -> None:
+    token = "ephemeral-read-only-token"
+    opener = SequenceOpener([FakeResponse(200, b'{"ok": true}')])
+    api = validate.GitHubApi(token, opener=opener)
+
+    assert api.get_json(f"/repos/{REPOSITORY}/git/ref/tags/{TAG}") == {"ok": True}
+
+    request = opener.requests[0]
+    assert request.full_url == f"{contract.GITHUB_API_ROOT}/repos/{REPOSITORY}/git/ref/tags/{TAG}"
+    assert request.get_header("Authorization") == f"Bearer {token}"
+    assert token not in request.full_url
+    assert request.data is None
+
+
+def test_github_api_403_failure_redacts_the_token() -> None:
+    token = "ephemeral-read-only-token"
+    opener = SequenceOpener(
+        [
+            urllib.error.HTTPError(
+                f"{contract.GITHUB_API_ROOT}/repos/{REPOSITORY}", 403, "Forbidden", {}, None
+            )
+        ]
+    )
+    api = validate.GitHubApi(token, opener=opener, attempts=1, sleep=lambda _: None)
+
+    with pytest.raises(validate.ValidationError, match="HTTP 403") as excinfo:
+        api.get_json(f"/repos/{REPOSITORY}")
+
+    assert token not in str(excinfo.value)
+    assert token not in repr(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert opener.requests[0].get_header("Authorization") == f"Bearer {token}"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("offline while sending ephemeral-read-only-token"),
+        TimeoutError("timed out while sending ephemeral-read-only-token"),
+        OSError("socket failure while sending ephemeral-read-only-token"),
+    ],
+)
+def test_github_api_sanitizes_network_failures_without_leaking_the_token(
+    failure: Exception,
+) -> None:
+    token = "ephemeral-read-only-token"
+    opener = SequenceOpener([failure, failure])
+    api = validate.GitHubApi(token, opener=opener, attempts=2, sleep=lambda _: None)
+
+    with pytest.raises(validate.ValidationError, match="request did not complete") as excinfo:
+        api.get_json(f"/repos/{REPOSITORY}")
+
+    assert token not in str(excinfo.value)
+    assert token not in repr(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    assert len(opener.requests) == 2
+    assert opener.requests[0].get_header("Authorization") == f"Bearer {token}"
+
+
+def test_github_api_prefers_the_http_error_branch_over_the_oserror_branch() -> None:
+    opener = SequenceOpener(
+        [
+            urllib.error.HTTPError(
+                f"{contract.GITHUB_API_ROOT}/repos/{REPOSITORY}", 404, "missing", {}, None
+            )
+        ]
+    )
+    api = validate.GitHubApi(
+        "ephemeral-read-only-token", opener=opener, attempts=1, sleep=lambda _: None
+    )
+
+    with pytest.raises(validate.ValidationError, match="does not exist") as excinfo:
+        api.get_json(f"/repos/{REPOSITORY}")
+
+    assert excinfo.value.__cause__ is None
+
+
+def test_github_api_refuses_to_send_the_token_to_a_registry_endpoint() -> None:
+    opener = SequenceOpener([FakeResponse(200, b"{}")])
+    api = validate.GitHubApi(
+        "ephemeral-read-only-token",
+        base_url=contract.DOCKER_HUB_API_ROOT,
+        opener=opener,
+    )
+
+    with pytest.raises(validate.ValidationError, match="canonical GitHub API endpoint"):
+        api.get_json("/v2/repositories/shareur/tgharbor/tags")
+
+    assert opener.requests == []
+
+    hub_opener = SequenceOpener([FakeResponse(200, b'{"count": 0, "results": [], "next": null}')])
+    hub = validate.DockerHubTags(opener=hub_opener)
+    assert hub.list_tags() == ()
+    assert hub_opener.requests[0].get_header("Authorization") is None
+
+
+def test_git_commands_do_not_inherit_the_github_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ephemeral-read-only-token")
+    assert "GITHUB_TOKEN" not in validate._git_environment()
 
 
 def test_verify_existing_cli_accepts_the_v023_published_identity(tmp_path: Path) -> None:
@@ -2321,14 +2485,28 @@ def test_verification_workflow_is_manual_read_only_and_never_publishes() -> None
         "docker rmi",
         "docker login",
         "delete",
+        "id-token",
+        "packages:",
+        "attestations:",
+        "actions: read",
     ):
         assert forbidden not in text
+    token_steps = {"resolve", "existing"}
+    seen_token_steps: set[str] = set()
     for step in job["steps"]:
         if "uses" in step:
             assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", step["uses"])
         env = step.get("env") or {}
-        assert "GITHUB_TOKEN" not in env
         assert all("secrets." not in str(value) for value in env.values())
+        if env.get("GITHUB_TOKEN") is not None:
+            assert step.get("id") in token_steps
+            assert env["GITHUB_TOKEN"] == "${{ github.token }}"
+            seen_token_steps.add(step["id"])
+        else:
+            assert "GITHUB_TOKEN" not in str(step.get("run", ""))
+    assert seen_token_steps == token_steps
+    assert text.count("GITHUB_TOKEN") == 2
+    assert text.count("${{ github.token }}") == 2
     assert '"git", "ls-remote"' in text
     assert "refs/heads/master" in text
     assert "resolved ambiguously" in text

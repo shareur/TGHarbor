@@ -17,6 +17,12 @@ This project follows a Keep a Changelog style while it remains pre-1.0.
 
 ### Fixed
 
+- The read-only `Docker image verification` workflow now authenticates its GitHub
+  metadata reads with the ephemeral `github.token`, scoped to the two resolver and
+  verification metadata steps. Tag and default-branch resolution therefore works for a
+  private repository without anonymous GitHub REST 403 failures. The token is restricted
+  to canonical GitHub API endpoints and is never used for Docker Hub or registry
+  authentication, Git remotes, command arguments, summaries, or the image runtime.
 - The Docker release verifier now scans image history by path and command context
   instead of broad substrings, so the legitimate runtime default
   `TGHARBOR_CONFIG=/config/config.yaml` is allowed while copied secrets, configuration

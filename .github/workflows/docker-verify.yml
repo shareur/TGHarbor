@@ -65,10 +65,12 @@ jobs:
                   path: workflow-source
                   fetch-depth: 1
                   persist-credentials: false
+            # The ephemeral token is scoped to this metadata step only.
             - name: Resolve and validate the published annotated tag
               id: resolve
               shell: bash
               env:
+                  GITHUB_TOKEN: ${{ github.token }}
                   RELEASE_TAG: ${{ inputs.release_tag }}
               run: |
                   set -euo pipefail
@@ -84,10 +86,13 @@ jobs:
                   persist-credentials: false
             - name: Set up QEMU for linux/arm64 runtime smoke
               uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+            # The same ephemeral token is used only for GitHub metadata reads. The
+            # Docker Hub discovery below remains anonymous and receives no token.
             - name: Discover the immutable digest and verify the existing image identity
               id: existing
               shell: bash
               env:
+                  GITHUB_TOKEN: ${{ github.token }}
                   RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
                   RELEASE_SHA: ${{ steps.resolve.outputs.release_sha }}
                   EXPECTED_DIGEST: ${{ inputs.expected_digest }}

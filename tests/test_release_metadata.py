@@ -170,8 +170,17 @@ def test_verification_only_workflow_is_read_only_and_secretless() -> None:
     assert "environment" not in job
     assert job["concurrency"]["cancel-in-progress"] is False
     assert "secrets." not in text
+    token_steps = {"resolve", "existing"}
+    seen_token_steps: set[str] = set()
     for step in job["steps"]:
-        assert "GITHUB_TOKEN" not in (step.get("env") or {})
+        env = step.get("env") or {}
+        if env.get("GITHUB_TOKEN") is not None:
+            assert step.get("id") in token_steps
+            assert env["GITHUB_TOKEN"] == "${{ github.token }}"
+            seen_token_steps.add(step["id"])
+        else:
+            assert "GITHUB_TOKEN" not in str(step.get("run", ""))
+    assert seen_token_steps == token_steps
     for forbidden in (
         "docker/login-action",
         "build-push-action",
@@ -179,6 +188,9 @@ def test_verification_only_workflow_is_read_only_and_secretless() -> None:
         "docker push",
         "docker build",
         "docker tag",
+        "id-token",
+        "packages:",
+        "attestations:",
     ):
         assert forbidden not in text
 

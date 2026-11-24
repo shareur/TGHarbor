@@ -203,6 +203,15 @@ def _request_url(base: str, path: str) -> str:
     return urllib.parse.urljoin(f"{base.rstrip('/')}/", path.lstrip("/"))
 
 
+def _is_canonical_github_api_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    canonical = urllib.parse.urlsplit(GITHUB_API_ROOT)
+    return (
+        parsed.scheme == canonical.scheme
+        and parsed.netloc.casefold() == canonical.netloc.casefold()
+    )
+
+
 class GitHubApi:
     """Small read-only GitHub REST client with bounded transient retries."""
 
@@ -223,6 +232,12 @@ class GitHubApi:
         self._timeout = timeout
         self._sleep = sleep
 
+    def _redact(self, value: object) -> str:
+        text = str(value)
+        if self._token:
+            text = text.replace(self._token, "[redacted]")
+        return text
+
     def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
@@ -234,9 +249,12 @@ class GitHubApi:
         return headers
 
     def get_json(self, path: str) -> Any:
-        request = urllib.request.Request(
-            _request_url(self._base_url, path), headers=self._headers(), method="GET"
-        )
+        url = _request_url(self._base_url, path)
+        if self._token and not _is_canonical_github_api_url(url):
+            raise ValidationError(
+                "GitHub API token is restricted to the canonical GitHub API endpoint"
+            )
+        request = urllib.request.Request(url, headers=self._headers(), method="GET")
         last_status: int | None = None
         for attempt in range(1, self._attempts + 1):
             try:
@@ -254,16 +272,20 @@ class GitHubApi:
             except urllib.error.HTTPError as exc:
                 last_status = exc.code
                 if exc.code == 404:
-                    raise ValidationError("GitHub API resource does not exist") from exc
+                    raise ValidationError("GitHub API resource does not exist") from None
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self._attempts:
                     self._sleep(float(attempt))
                     continue
-                raise ValidationError(f"GitHub API returned HTTP {exc.code}") from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise ValidationError(
+                    self._redact(f"GitHub API returned HTTP {exc.code}")
+                ) from None
+            # urllib.error.URLError and TimeoutError are OSError subclasses; the
+            # more specific HTTPError branch above keeps HTTP failures distinct.
+            except OSError:
                 if attempt < self._attempts:
                     self._sleep(float(attempt))
                     continue
-                raise ValidationError("GitHub API request did not complete") from exc
+                raise ValidationError("GitHub API request did not complete") from None
         raise ValidationError(f"GitHub API request did not complete (last HTTP {last_status})")
 
 
@@ -867,11 +889,6 @@ def _api_from_environment(environ: Mapping[str, str]) -> GitHubApi:
     return GitHubApi(environ.get("GITHUB_TOKEN"))
 
 
-def _anonymous_api_from_environment(environ: Mapping[str, str]) -> GitHubApi:
-    del environ
-    return GitHubApi(None)
-
-
 def _hub_from_environment(environ: Mapping[str, str]) -> DockerHubTags:
     del environ
     return DockerHubTags()
@@ -1203,7 +1220,7 @@ def main(
             remote = _resolve_existing_command(
                 release_tag=arguments.release_tag,
                 output_path=arguments.output,
-                api=_anonymous_api_from_environment(environment),
+                api=api_factory(environment),
             )
             print(
                 f"Resolved existing annotated tag {remote.tag} to {remote.commit_sha} "
@@ -1217,7 +1234,7 @@ def main(
                 checkout=arguments.checkout,
                 expected_digest=arguments.expected_digest,
                 output_path=arguments.output,
-                api=_anonymous_api_from_environment(environment),
+                api=api_factory(environment),
                 registry=image_registry_factory(environment),
                 retry_attempts=arguments.retry_attempts,
                 retry_delay=arguments.retry_delay,
