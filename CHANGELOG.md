@@ -23,18 +23,22 @@ This project follows a Keep a Changelog style while it remains pre-1.0.
   private repository without anonymous GitHub REST 403 failures. The token is restricted
   to canonical GitHub API endpoints and is never used for Docker Hub or registry
   authentication, Git remotes, command arguments, summaries, or the image runtime.
-- The Docker release verifier now scans image history by path and command context
-  instead of broad substrings, so the legitimate runtime default
-  `TGHARBOR_CONFIG=/config/config.yaml` is allowed while copied secrets, configuration
-  files, tests, Git material, sessions, databases, logs, and sensitive environment
-  values remain rejected.
-- The history scan now distinguishes shell, linker, and printf escape syntax from path
-  separators within a command word, so upstream base-image commands such as
-  `-Wl,-rpath='\$\$ORIGIN/../lib'` and `printf "*%s\n"` no longer fail verification.
-  Windows drive and UNC roots, unescaped backslash separators, forbidden payload names
-  and suffixes, and URLs with embedded credentials remain rejected, and every other
-  word in the same command is still checked. Layer archive scanning remains the
-  authoritative actual-member control.
+- The Docker release verifier now separates history scanning from layer scanning by
+  authority. History scanning rejects secrets, credential-bearing URLs, sensitive
+  `ENV`/`ARG` names and assignments, unsafe runtime defaults, and payload paths only
+  where instruction semantics carry reliable intent: precisely parsed `COPY`/`ADD`
+  source and destination operands and `ENV`/`ARG` values. The runtime default
+  `TGHARBOR_CONFIG=/config/config.yaml` is therefore accepted, while a copied `.env`,
+  configuration file, test, Git, session, database, or log artifact still fails, and a
+  secret embedded in a `RUN` command, `ENV`/`ARG`, URL, author, or comment fails even
+  when no file remains. Opaque shell text in Docker-generated base-image history is no
+  longer treated as payload evidence, so ordinary arguments such as `test`, `tests`, or
+  `config.yaml` and shell, linker, or printf escape syntax such as
+  `-Wl,-rpath='\$\$ORIGIN/../lib'` or `printf "*%s\n"` are accepted; malformed
+  structured instructions and non-string history fields fail closed. The per-layer
+  archive scan is unchanged and remains the authoritative forbidden-payload control: it
+  inspects every layer independently, so a forbidden file deleted by a later layer,
+  whitelisted, or replaced, including an `.env` removed by `RUN rm`, still fails.
 - Layer scanning accepts only the canonical tar root directory marker `.` with
   directory metadata and rejects non-directory or duplicate root markers, unsafe link
   or device metadata, and dot components that would bypass normalization, forbidden

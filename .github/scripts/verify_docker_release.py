@@ -124,6 +124,9 @@ SENSITIVE_ENVIRONMENT_NAME_PARTS = (
     "api_hash",
     "api-hash",
     "apihash",
+    "api_key",
+    "api-key",
+    "apikey",
     "bot_token",
     "bot-token",
     "credential",
@@ -140,28 +143,29 @@ SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"[0-9]{7,12}:[A-Za-z0-9_-]{30,}"),
     re.compile(r"(?i)(?:api[_-]?hash|bot[_-]?token|password|secret|token)\s*[=:]\s*\S+"),
 )
-HISTORY_EXCLUDED_DIRECTORY_NAMES = frozenset({".git", "tests"})
-# Shell, printf, and linker arguments record a backslash as an escape
-# introducer rather than as a path separator. Upstream base-image layers
-# legitimately carry such commands, for example
-# ``LDFLAGS="${LDFLAGS:-} -Wl,-rpath='\$\$ORIGIN/../lib'"`` or
-# ``printf "*%s\n"``. Recognizing exactly those sequences keeps escape
-# syntax out of the path checks, while a Windows drive or UNC root and any
-# unescaped backslash remain ambiguous path syntax and still fail closed.
-HISTORY_ESCAPE_PATTERN = re.compile(
-    r"""\\(?:[0-7]{1,3}|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}"""
-    r"""|['"$`\\ ;(){}\[\]!*?#~|&<>])"""
-)
-HISTORY_TRAILING_LETTER_ESCAPE_PATTERN = re.compile(r"\\[abefnrtv]$")
-# A word may retain only a dangling backslash after surrounding punctuation is
-# trimmed, which is a shell line continuation or the escaped form of ``\(``,
-# ``\)`` or ``\;``. The path checks below still see the separator form.
-HISTORY_TRAILING_BACKSLASH_PATTERN = re.compile(r"\\$")
-HISTORY_PRINTF_LETTER_ESCAPE_PATTERN = re.compile(r"\\[abefnrtv]")
-HISTORY_PRINTF_CONVERSION_PATTERN = re.compile(
-    r"%[-+ #0]*(?:[0-9]+|\*)?(?:\.(?:[0-9]+|\*))?(?:hh|h|ll|l|j|z|t|L)?"
-    r"[diouxXeEfFgGaAcspn%]"
-)
+# Docker records history in one of two machine-generated shapes: the legacy
+# builder emits ``/bin/sh -c #(nop)  <INSTRUCTION> ...`` and BuildKit emits
+# ``<INSTRUCTION> ... # buildkit``. Only those shapes carry reliable
+# instruction boundaries, so only their COPY/ADD/ENV/ARG operands are treated
+# as payload evidence. Every other ``created_by`` value is an opaque shell
+# command or free-form metadata text whose words are not payload names: a
+# trusted base image may legitimately run ``find ... -name tests``, use linker
+# or printf escape syntax, or mention configuration words. Files on disk are
+# covered authoritatively and independently by the per-layer archive scan,
+# which inspects every layer independently, including members that later
+# layers delete or whitelist.
+HISTORY_NOP_MARKER = "#(nop)"
+HISTORY_NOP_PREFIXES = frozenset({"", "/bin/sh -c"})
+HISTORY_BUILDKIT_MARKER = re.compile(r"\s+#\s*buildkit$")
+HISTORY_PATH_INSTRUCTIONS = frozenset({"ADD", "COPY"})
+HISTORY_VALUE_INSTRUCTIONS = frozenset({"ARG", "ENV"})
+HISTORY_STRUCTURED_INSTRUCTIONS = HISTORY_PATH_INSTRUCTIONS | HISTORY_VALUE_INSTRUCTIONS
+HISTORY_FIELD_NAMES = ("created_by", "comment", "author")
+HISTORY_COPY_SEPARATOR = "in"
+# Dockerfile ENV and ARG names are environment-style identifiers. Requiring
+# that shape keeps option words such as ``--mount=type=secret`` out of the
+# sensitive-name check while still catching credential-bearing assignments.
+HISTORY_ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 URL_WITH_CREDENTIALS_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@")
 
 REQUIRED_LABELS = {
@@ -483,211 +487,178 @@ def validate_release_labels(labels: Mapping[str, Any], metadata: ReleaseMetadata
         raise VerificationError("source label does not match the verified project source")
 
 
-def _history_tokens(command: str) -> list[str]:
+def _history_instruction(value: str) -> tuple[str, tuple[str, ...]] | None:
+    """Return the parsed Dockerfile instruction of a machine-generated entry.
+
+    ``None`` means the text carries no trustworthy instruction boundary: it is
+    an opaque shell command or free-form ``comment``/``author`` metadata.
+    Path-like words inside such text are not payload evidence, because Docker
+    does not record where a nested shell argument ends. A recognized
+    COPY/ADD/ENV/ARG instruction that cannot be tokenized raises instead, so
+    malformed structured metadata fails closed.
+    """
+
+    text = value.strip()
+    if not text:
+        return None
+    if HISTORY_NOP_MARKER in text:
+        prefix, _, remainder = text.partition(HISTORY_NOP_MARKER)
+        if prefix.strip() not in HISTORY_NOP_PREFIXES:
+            return None
+        text = remainder.strip()
+    else:
+        text = HISTORY_BUILDKIT_MARKER.sub("", text)
+    head = text.split(maxsplit=1)[0].upper() if text else ""
+    if head not in HISTORY_STRUCTURED_INSTRUCTIONS:
+        return None
     try:
-        tokens = shlex.split(command, comments=False, posix=True)
-    except ValueError:
-        tokens = command.split()
-    return [token for token in tokens if token and not token.startswith("#")]
+        tokens = shlex.split(text, comments=False, posix=True)
+    except ValueError as exc:
+        raise VerificationError(f"image history {head} instruction is malformed") from exc
+    if not tokens or tokens[0].upper() != head:
+        raise VerificationError(f"image history {head} instruction is malformed")
+    return head, tuple(tokens[1:])
 
 
-def _history_escape_free(word: str) -> str:
-    """Remove recognized shell, linker, and printf escapes from one word.
+def _history_secret_problem(text: str) -> str | None:
+    """Return a reason when history text carries a secret or credential value.
 
-    Letter escapes such as ``\n`` are ambiguous with a Windows separator, so
-    they are removed only when the word is a printf format (it carries a
-    conversion such as ``%s``) or when the escape closes the word. Numeric,
-    shell-punctuation, and dangling trailing escapes are removed
-    unconditionally because no path component is spelled that way.
+    This scan is independent of instruction shape: a token, password, or
+    credential URL recorded in a RUN command, ENV/ARG assignment, author, or
+    comment fails even when no file remains in any layer.
     """
 
-    residue = HISTORY_TRAILING_BACKSLASH_PATTERN.sub("", word)
-    residue = HISTORY_ESCAPE_PATTERN.sub("", residue)
-    residue = HISTORY_TRAILING_LETTER_ESCAPE_PATTERN.sub("", residue)
-    if HISTORY_PRINTF_CONVERSION_PATTERN.search(word) is not None:
-        residue = HISTORY_PRINTF_LETTER_ESCAPE_PATTERN.sub("", residue)
-    return residue
-
-
-def _history_backslash_problem(word: str) -> str | None:
-    """Return a reason when one word uses a backslash as path syntax.
-
-    A Windows drive or UNC root is absolute path syntax, and any backslash
-    that is not a recognized shell, linker, or printf escape is an ambiguous
-    separator. Escape-only words remain path candidates for the checks below,
-    so the escape allowance cannot exempt a forbidden component.
-    """
-
-    if word.startswith("\\\\"):
-        return "history path is an ambiguous absolute path"
-    if "\\" in _history_escape_free(word):
-        return "history path contains an ambiguous backslash"
+    if URL_WITH_CREDENTIALS_PATTERN.search(text) is not None:
+        return "history contains a URL with embedded credentials"
+    for pattern in SENSITIVE_VALUE_PATTERNS:
+        if pattern.search(text) is not None:
+            return "history contains a sensitive value"
+    for word in text.split():
+        candidate = word.strip("\"'`;,")
+        name, separator, _value = candidate.partition("=")
+        if not separator:
+            continue
+        name = name.lstrip("-")
+        if HISTORY_ENVIRONMENT_NAME_PATTERN.fullmatch(name) is None:
+            continue
+        if any(part in name.casefold() for part in SENSITIVE_ENVIRONMENT_NAME_PARTS):
+            return "history sets a sensitive environment variable name"
     return None
 
 
-def _history_word_problem(word: str, *, allow_runtime_mounts: bool) -> str | None:
-    """Return a payload reason for one whitespace-delimited history word."""
+def _history_payload_path_problem(value: str, *, allow_runtime_mounts: bool) -> str | None:
+    """Return a payload reason for one structured COPY/ADD/ENV/ARG operand.
 
-    candidate = word.strip().strip("\"'`()[]{};,")
-    if not candidate or candidate.startswith(("-", "#")):
+    Operands are only checked where instruction semantics make them a path or
+    a value, so a generic word inside a shell command is never mistaken for a
+    copied payload name. Both ``/`` and ``\\`` separate path components, so a
+    Windows drive or UNC spelling cannot hide a forbidden component.
+    """
+
+    candidate = value.strip().strip("\"'`")
+    if not candidate or candidate.startswith(("-", "#")) or "://" in candidate:
         return None
-    if URL_WITH_CREDENTIALS_PATTERN.search(candidate) is not None:
-        return "history references a URL with embedded credentials"
-    if "://" in candidate and not candidate.startswith(("/", "./", "../")):
-        return None
-    if WINDOWS_DRIVE_PATTERN.match(candidate) is not None:
-        return "history path is an ambiguous absolute path"
-    if "\\" in candidate:
-        problem = _history_backslash_problem(candidate)
-        if problem is not None:
-            return problem
-        candidate = candidate.replace("\\", "/")
-    normalized = candidate
+    normalized = candidate.replace("\\", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]
     normalized = normalized.rstrip("/")
-    if normalized in {"", "."}:
+    parts = tuple(part.casefold() for part in normalized.split("/") if part)
+    if not parts:
         return None
-    if normalized == "..":
+    if ".." in parts:
         return "history path traverses outside its root"
-    if normalized.startswith("//"):
-        return "history path is an ambiguous absolute path"
-    absolute = normalized.startswith("/") or WINDOWS_DRIVE_PATTERN.match(normalized) is not None
     if (
-        absolute
-        and allow_runtime_mounts
+        allow_runtime_mounts
+        and normalized.startswith("/")
         and any(
             normalized == prefix.rstrip("/") or normalized.startswith(prefix)
             for prefix in RUNTIME_MOUNT_PREFIXES
         )
-        and normalized.rsplit("/", 1)[-1].casefold() in RUNTIME_CONFIG_BASENAMES
+        and parts[-1] in RUNTIME_CONFIG_BASENAMES
     ):
         return None
-    parts = tuple(part.casefold() for part in normalized.split("/") if part)
-    if not parts:
-        return None
-    if any(part == ".." for part in parts):
-        return "history path traverses outside its root"
-    if any(part in HISTORY_EXCLUDED_DIRECTORY_NAMES for part in parts):
+    if any(part in _FORBIDDEN_DIRECTORIES_CASEFOLD for part in parts):
         return "history references excluded development material"
-    basename = parts[-1]
-    if basename in _FORBIDDEN_BASENAMES_CASEFOLD:
+    if any(part in _FORBIDDEN_BASENAMES_CASEFOLD for part in parts):
         return "history references a restricted, configuration, or development file"
-    if basename.endswith(FORBIDDEN_SUFFIXES):
+    if parts[-1].endswith(FORBIDDEN_SUFFIXES):
         return "history references a user-state file suffix"
     return None
 
 
-def _history_path_problem(value: str, *, allow_runtime_mounts: bool) -> str | None:
-    """Return a payload reason for a history path or command fragment.
+def _history_copy_instruction_problem(tokens: tuple[str, ...]) -> str | None:
+    """Check COPY/ADD operands, whose instruction semantics are payload paths."""
 
-    The fragment is evaluated word by word so that shell quoting which groups
-    an option with an escaped linker argument keeps its option context, and so
-    that a printed format string cannot exempt a different word in the same
-    fragment. The check is path-aware rather than substring-based: the
-    legitimate runtime default ``TGHARBOR_CONFIG=/config/config.yaml`` is a
-    mount path, while a copied ``.env``, ``config.yaml``, test, Git, session,
-    database, or log path remains a forbidden payload.
-    """
-
-    for word in value.split():
-        problem = _history_word_problem(word, allow_runtime_mounts=allow_runtime_mounts)
+    operands = [token for token in tokens if not token.startswith("--")]
+    separator = HISTORY_COPY_SEPARATOR
+    if separator in operands[1:-1]:
+        split = operands.index(separator, 1, len(operands) - 1)
+        operands = operands[:split] + operands[split + 1 :]
+    if len(operands) < 2:
+        return "history copy instruction has no destination"
+    for operand in operands:
+        problem = _history_payload_path_problem(operand, allow_runtime_mounts=False)
         if problem is not None:
             return problem
     return None
 
 
-def _history_assignment_problem(token: str) -> str | None:
-    candidate = token.strip("\"'`;,")
-    if "=" not in candidate:
-        return None
-    key, value = candidate.split("=", 1)
-    key = key.lstrip("-").strip()
-    if not key:
-        return None
-    lowered_key = key.casefold()
-    if any(part in lowered_key for part in SENSITIVE_ENVIRONMENT_NAME_PARTS):
-        return "history sets a sensitive environment variable name"
-    for pattern in SENSITIVE_VALUE_PATTERNS:
-        if pattern.search(candidate):
-            return "history sets a sensitive environment variable value"
-    return _history_path_problem(value, allow_runtime_mounts=True)
+def _history_value_instruction_problem(tokens: tuple[str, ...]) -> str | None:
+    """Check ENV/ARG declarations, whose semantics are names and values."""
 
-
-def _history_command_problem(value: str) -> str | None:
-    tokens = _history_tokens(value)
-    index = 0
-    instruction_keywords = {
-        "ADD",
-        "ARG",
-        "CMD",
-        "COPY",
-        "ENTRYPOINT",
-        "ENV",
-        "LABEL",
-        "RUN",
-        "USER",
-        "WORKDIR",
-    }
-    while index < len(tokens):
-        token = tokens[index]
-        upper = token.upper()
-        if upper in {"COPY", "ADD"}:
-            sources: list[str] = []
-            cursor = index + 1
-            while cursor < len(tokens):
-                candidate = tokens[cursor]
-                if candidate.upper() in instruction_keywords:
-                    break
-                cursor += 1
-                sources.append(candidate)
-            if len(sources) >= 2:
-                for source in sources[:-1]:
-                    problem = _history_path_problem(source, allow_runtime_mounts=False)
-                    if problem is not None:
-                        return problem
-            index = cursor
+    for token in tokens:
+        if token.startswith("-"):
             continue
-        if upper in {"ENV", "ARG"}:
-            cursor = index + 1
-            while cursor < len(tokens):
-                candidate = tokens[cursor]
-                if candidate.upper() in instruction_keywords:
-                    break
-                cursor += 1
-                if candidate.startswith("-"):
-                    continue
-                problem = _history_assignment_problem(candidate)
-                if problem is not None:
-                    return problem
-                if "=" not in candidate and any(
-                    part in candidate.casefold() for part in SENSITIVE_ENVIRONMENT_NAME_PARTS
-                ):
-                    return "history sets a sensitive environment variable name"
-            index = cursor
-            continue
-        problem = _history_assignment_problem(token)
+        name, separator, value = token.partition("=")
+        if not separator:
+            if HISTORY_ENVIRONMENT_NAME_PATTERN.fullmatch(name) is not None and any(
+                part in name.casefold() for part in SENSITIVE_ENVIRONMENT_NAME_PARTS
+            ):
+                return "history sets a sensitive environment variable name"
+            value = token
+        problem = _history_payload_path_problem(value, allow_runtime_mounts=True)
         if problem is not None:
             return problem
-        problem = _history_path_problem(token, allow_runtime_mounts=True)
-        if problem is not None:
-            return problem
-        index += 1
     return None
 
 
 def assert_history_has_no_project_payload(history: object) -> None:
+    """Reject secrets and structured payload instructions recorded in history.
+
+    History is not the authoritative control for files on disk: the per-layer
+    archive scan inspects every layer independently, including members that a
+    later layer deletes or whitelists. History scanning therefore rejects
+    secrets, credential-bearing URLs, sensitive ENV/ARG metadata, and
+    precisely parsed COPY/ADD operands, and it ignores opaque shell command
+    text that trusted upstream base images legitimately contain.
+    """
+
     entries = _require_list(history, label="image history")
     for entry in entries:
         entry_map = _require_mapping(entry, label="history entry")
-        for key in ("created_by", "comment", "author"):
-            value = entry_map.get(key)
-            if not isinstance(value, str):
+        for key in HISTORY_FIELD_NAMES:
+            if key not in entry_map:
                 continue
-            if _history_command_problem(value) is not None:
-                raise VerificationError(
-                    f"image history references a forbidden project payload name ({key})"
-                )
+            value = entry_map[key]
+            if not isinstance(value, str):
+                raise VerificationError(f"image history {key} must be a string")
+            if not value:
+                continue
+            problem = _history_secret_problem(value)
+            if problem is not None:
+                raise VerificationError(f"image history {key}: {problem}")
+            instruction = _history_instruction(value)
+            if instruction is None:
+                continue
+            keyword, tokens = instruction
+            if keyword in HISTORY_PATH_INSTRUCTIONS:
+                problem = _history_copy_instruction_problem(tokens)
+            elif keyword in HISTORY_VALUE_INSTRUCTIONS:
+                problem = _history_value_instruction_problem(tokens)
+            else:
+                raise VerificationError(f"image history {key}: unsupported instruction {keyword}")
+            if problem is not None:
+                raise VerificationError(f"image history {key}: {problem}")
 
 
 def _forbidden_layer_path_reason(

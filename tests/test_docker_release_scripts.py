@@ -1693,57 +1693,56 @@ def test_registry_release_rejects_forbidden_payload_history() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        (
-            "/bin/sh -c #(nop)  ENV PYTHONDONTWRITEBYTECODE=1 "
-            "PYTHONUNBUFFERED=1 TGHARBOR_CONFIG=/config/config.yaml"
-        ),
-        "ENV TGHARBOR_DATA_DIR=/data TGHARBOR_DOWNLOADS_DIR=/downloads",
-        "ARG TGHARBOR_IMAGE_SOURCE=https://github.com/shareur/TGHarbor",
-        f"ARG TGHARBOR_IMAGE_REVISION={PUBLISHED_V023_SHA}",
-        "COPY pyproject.toml README.md ./",
-        "RUN pip install --no-cache-dir .",
-        "RUN mkdir -p /config /data /downloads",
-    ],
+SAFE_HISTORY_ENTRIES = (
+    # Project Dockerfile instructions in both recorded shapes.
+    "COPY pyproject.toml README.md ./",
+    "COPY src ./src",
+    "COPY . . # buildkit",
+    "COPY --from=builder /out /app",
+    "/bin/sh -c #(nop) ADD file:0f2b1c9d in /",
+    (
+        "/bin/sh -c #(nop)  ENV PYTHONDONTWRITEBYTECODE=1 "
+        "PYTHONUNBUFFERED=1 TGHARBOR_CONFIG=/config/config.yaml"
+    ),
+    "ENV TGHARBOR_DATA_DIR=/data TGHARBOR_DOWNLOADS_DIR=/downloads",
+    "ARG TGHARBOR_IMAGE_SOURCE=https://github.com/shareur/TGHarbor",
+    f"ARG TGHARBOR_IMAGE_REVISION={PUBLISHED_V023_SHA}",
+    "ARG TGHARBOR_IMAGE_VERSION=0.2.3",
+    "RUN pip install --no-cache-dir .",
+    "RUN mkdir -p /config /data /downloads",
+    "RUN --mount=type=secret,id=pip pip install --no-cache-dir .",
+    "WORKDIR /app",
+    "USER tgharbor",
+    'CMD ["run"]',
+    # Opaque shell text is not payload evidence: the per-layer archive scan is
+    # the authoritative control for files, including removed ones.
+    "RUN rm -f .env",
+    "RUN find / -name tests -o -name docs -o -name config.yaml",
+    r"""RUN printf "%s\n" .env config.yaml tests""",
+    "RUN cp .env /tmp/.env && rm /tmp/.env",
 )
-def test_history_scan_allows_runtime_paths_and_safe_build_commands(entry: str) -> None:
+
+
+@pytest.mark.parametrize("entry", SAFE_HISTORY_ENTRIES)
+def test_history_scan_accepts_structured_safe_instructions_and_runtime_defaults(
+    entry: str,
+) -> None:
     assert verify.assert_history_has_no_project_payload([{"created_by": entry}]) is None
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        "COPY .env /app/.env",
-        "COPY config.yaml /app/config.yaml",
-        "ADD compose.yaml /app/",
-        "RUN cp .env /app/.env",
-        "COPY tests/unit.py /app/tests/unit.py",
-        "COPY .git/config /app/.git/config",
-        "RUN echo state > /app/state.session",
-        "RUN touch /app/library.sqlite3",
-        "RUN echo log > /app/service.log",
-        "ENV TELEGRAM_API_HASH=redacted-api-hash-fixture",
-        "ENV TELEGRAM_BOT_TOKEN=123456789:AAHabcdefghijklmnopqrstuvwxyz012345",
-        "ARG TELEGRAM_PHONE=+15551234567",
-        "ENV SESSION_PATH=/sessions/name.session",
-        "ENV TGHARBOR_CONFIG=config.yaml",
-        "ENV TGHARBOR_CONFIG=/config/.env",
-        "ENV TGHARBOR_CONFIG=/config/state.session",
-        "COPY /config/config.yaml /app/config.yaml",
-    ],
-)
-def test_history_scan_rejects_actual_payload_paths_and_sensitive_values(entry: str) -> None:
-    with pytest.raises(verify.VerificationError):
-        verify.assert_history_has_no_project_payload([{"created_by": entry}])
-
-
-# Observed ``created_by`` shapes of the upstream ``python:3.15-slim`` build layer an
-# image inherits. The backslashes are shell, linker, and printf escapes rather than
-# project payload paths, so the history scan must accept them while still rejecting a
-# payload name that appears anywhere in the same command text.
+# Complete observed ``created_by`` shapes of the upstream ``python:3.15-slim`` layers
+# an image inherits, including the failing verification run's ``find`` command. These
+# entries are opaque shell commands: their backslashes are shell, linker, and printf
+# escape syntax and their words are ordinary command arguments, so no path check may
+# treat them as project payloads.
 UPSTREAM_BASE_IMAGE_CREATED_BY = (
+    "/bin/sh -c #(nop)  ENV PATH=/usr/local/bin:$PATH",
+    "/bin/sh -c #(nop)  ENV LANG=C.UTF-8",
+    '/bin/sh -c #(nop)  CMD ["python3"]',
+    (
+        "/bin/sh -c set -eux; \tapt-get update; \tapt-get install -y --no-install-recommends "
+        "\t\tca-certificates \t\tnetbase \t\ttzdata \t; \trm -rf /var/lib/apt/lists/*"
+    ),
     (
         r"""/bin/sh -c set -eux; LDFLAGS="${LDFLAGS:-} """
         r"""-Wl,-rpath='\$\$ORIGIN/../lib'" ./configure --enable-shared """
@@ -1753,6 +1752,10 @@ UPSTREAM_BASE_IMAGE_CREATED_BY = (
     r"""/bin/sh -c awk 'BEGIN { printf "*%s\n", $0 }' /usr/local/lib/python3.15/README.rst""",
     r"""/bin/sh -c printf '\n' > /usr/local/lib/python3.15/site-packages/.keep""",
     r"""/bin/sh -c find /usr/local/lib/python3.15 -type f \( -name '*.pyc' \) -delete""",
+    (
+        r"""/bin/sh -c find /usr/local/lib/python3.15/test -type d \( -name test """
+        r"""-o -name tests -o -name idle_test \) -exec rm -rf '{}' +"""
+    ),
 )
 
 
@@ -1760,70 +1763,115 @@ def test_upstream_base_image_history_fixture_matches_observed_patterns() -> None
     joined = "\n".join(UPSTREAM_BASE_IMAGE_CREATED_BY)
     assert r"-Wl,-rpath='\$\$ORIGIN/../lib'" in joined
     assert r'printf "*%s\n"' in joined
-    # The fixture must reach the escape analysis: these tokens keep a backslash
-    # after tokenization, which the previous blanket rejection refused outright.
-    retained = [
-        token
-        for entry in UPSTREAM_BASE_IMAGE_CREATED_BY
-        for token in verify._history_tokens(entry)
-        if "\\" in token and not token.startswith("-")
-    ]
-    assert retained
+    assert "-name test -o -name tests -o -name idle_test" in joined
+    # The shell commands are opaque to the structured instruction parser, so
+    # none of their words can be mistaken for a project payload path. Only the
+    # machine-generated ENV/CMD records expose instruction semantics.
+    opaque = [entry for entry in UPSTREAM_BASE_IMAGE_CREATED_BY if "/bin/sh -c set" in entry]
+    opaque += [entry for entry in UPSTREAM_BASE_IMAGE_CREATED_BY if "printf" in entry]
+    opaque += [entry for entry in UPSTREAM_BASE_IMAGE_CREATED_BY if "-name '*.pyc'" in entry]
+    opaque += [entry for entry in UPSTREAM_BASE_IMAGE_CREATED_BY if "idle_test" in entry]
+    assert opaque
+    assert all(verify._history_instruction(entry) is None for entry in opaque)
+    assert verify._history_instruction("/bin/sh -c #(nop)  ENV PATH=/usr/local/bin:$PATH") == (
+        "ENV",
+        ("PATH=/usr/local/bin:$PATH",),
+    )
 
 
 @pytest.mark.parametrize("entry", UPSTREAM_BASE_IMAGE_CREATED_BY)
-def test_history_scan_accepts_upstream_base_image_escape_commands(entry: str) -> None:
+def test_history_scan_accepts_complete_upstream_base_image_history(entry: str) -> None:
     assert verify.assert_history_has_no_project_payload([{"created_by": entry}]) is None
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        r'COPY ".env\backup" /app/',
-        r'COPY "tests\unit.py" /app/',
-        r'COPY "..\..\etc" /app/',
-        r'COPY "C:\Users\Public\state.session" /app/',
-        r'COPY "\\server\share\config.yaml" /app/',
-        r'RUN cp "app\restricted\tree" /app/',
-        r'RUN cp "app\bin\.env" /app/',
-        r'RUN cp ".git\config" /app/',
-        r'RUN cp "app\main.py\state.session" /app/',
-        r'RUN sha256sum "%s\tests" /app/',
-        # Unbalanced quoting forces the whitespace fallback tokenizer, which retains
-        # raw backslashes instead of letting ``shlex`` consume them.
-        r"""COPY '.env\backup /app/""",
-        r"""RUN cp '..\..\etc /app/""",
-    ],
+PAYLOAD_PATH_HISTORY_ENTRIES = (
+    "COPY .env /app/.env",
+    "COPY .env.local /app/.env.local",
+    "COPY config.yaml /app/config.yaml",
+    "ADD compose.yaml /app/",
+    "ADD compose.override.yaml /app/",
+    "COPY tests/unit.py /app/tests/unit.py",
+    "COPY tests /app/tests # buildkit",
+    "COPY .git/config /app/.git/config",
+    "COPY docs/README.md /app/docs/README.md",
+    "COPY app/session.session /app/session.session",
+    "COPY app/library.sqlite3 /app/library.sqlite3",
+    "COPY app/service.log /app/service.log",
+    "COPY safe.txt /app/.env",
+    "COPY /config/config.yaml /app/config.yaml",
+    "COPY --from=builder /src /app/tests",
+    r'COPY ".env\backup" /app/',
+    r'COPY "..\..\etc" /app/',
+    r'COPY "C:\Users\Public\state.session" /app/',
+    r'COPY "\\server\share\config.yaml" /app/',
+    # Malformed structured instructions fail closed instead of being skipped.
+    'COPY ".env /app/',
+    '/bin/sh -c #(nop)  COPY ".env /app/',
 )
-def test_history_scan_rejects_backslash_path_payloads(entry: str) -> None:
+
+
+@pytest.mark.parametrize("entry", PAYLOAD_PATH_HISTORY_ENTRIES)
+def test_history_scan_rejects_copied_payload_paths(entry: str) -> None:
     with pytest.raises(verify.VerificationError):
         verify.assert_history_has_no_project_payload([{"created_by": entry}])
 
 
-def test_history_scan_rejects_payloads_beside_legitimate_escape_syntax() -> None:
-    for entry in (
-        r'RUN printf "%s\n" ".env\backup"',
-        r'RUN printf "%s\n" .env',
-        r'RUN printf "%s\n" config.yaml',
-        r'RUN printf "%s\n" && cp .env /app/.env',
-    ):
-        with pytest.raises(verify.VerificationError):
-            verify.assert_history_has_no_project_payload([{"created_by": entry}])
+PAYLOAD_VALUE_HISTORY_ENTRIES = (
+    "ENV TELEGRAM_API_HASH=redacted-api-hash-fixture",
+    "ENV TELEGRAM_BOT_TOKEN=123456789:AAHabcdefghijklmnopqrstuvwxyz012345",
+    "ARG TELEGRAM_PHONE=+15551234567",
+    "ENV TGHARBOR_SESSION=redacted",
+    "ENV SESSION_PATH=/sessions/name.session",
+    "ARG API_KEY=redacted",
+    "ENV TGHARBOR_CONFIG=config.yaml",
+    "ENV TGHARBOR_CONFIG=/app/config.yaml",
+    "ENV TGHARBOR_CONFIG=/config/.env",
+    "ENV TGHARBOR_CONFIG=/config/state.session",
+    "ENV TGHARBOR_LOG_PATH=/app/service.log",
+    "/bin/sh -c #(nop)  ENV TELEGRAM_BOT_TOKEN=123456789:AAHabcdefghijklmnopqrstuvwxyz012345",
+    "/bin/sh -c #(nop)  ARG TGHARBOR_CONFIG=/app/config.yaml",
+    'ENV "TELEGRAM_BOT_TOKEN=redacted',
+)
 
 
-def test_history_scan_rejects_url_with_embedded_credentials() -> None:
+@pytest.mark.parametrize("entry", PAYLOAD_VALUE_HISTORY_ENTRIES)
+def test_history_scan_rejects_sensitive_and_unsafe_env_arg_defaults(entry: str) -> None:
     with pytest.raises(verify.VerificationError):
-        verify.assert_history_has_no_project_payload(
-            [{"created_by": "ARG TGHARBOR_SOURCE=https://user:secret@github.com/shareur/TGHarbor"}]
-        )
+        verify.assert_history_has_no_project_payload([{"created_by": entry}])
+
+
+SECRET_HISTORY_ENTRIES = (
+    "RUN export TELEGRAM_BOT_TOKEN=123456789:AAHabcdefghijklmnopqrstuvwxyz012345",
+    "RUN export BOT_TOKEN=redacted-plaintext",
+    "RUN echo 'api_hash=redacted' >> /app/.env.local",
+    "RUN git clone https://user:secret@github.com/shareur/TGHarbor /tmp/repo",
+    "ARG TGHARBOR_SOURCE=https://user:secret@github.com/shareur/TGHarbor",
+    "ADD https://user:secret@example.invalid/archive.tar.gz /app/",
+)
+
+
+@pytest.mark.parametrize("entry", SECRET_HISTORY_ENTRIES)
+def test_history_scan_rejects_secrets_that_leave_no_file(entry: str) -> None:
+    with pytest.raises(verify.VerificationError):
+        verify.assert_history_has_no_project_payload([{"created_by": entry}])
 
 
 def test_history_scan_applies_to_comment_and_author_fields() -> None:
     for key in ("comment", "author"):
-        with pytest.raises(verify.VerificationError):
-            verify.assert_history_has_no_project_payload(
-                [{key: "COPY config.yaml /app/config.yaml"}]
-            )
+        for value in (
+            "COPY config.yaml /app/config.yaml",
+            "https://user:secret@github.com/shareur/TGHarbor",
+            "TELEGRAM_BOT_TOKEN=123456789:AAHabcdefghijklmnopqrstuvwxyz012345",
+        ):
+            with pytest.raises(verify.VerificationError):
+                verify.assert_history_has_no_project_payload([{key: value}])
+
+
+def test_history_scan_fails_closed_on_malformed_metadata() -> None:
+    with pytest.raises(verify.VerificationError, match="must be a string"):
+        verify.assert_history_has_no_project_payload([{"created_by": 123}])
+    with pytest.raises(verify.VerificationError, match="must be a JSON object"):
+        verify.assert_history_has_no_project_payload(["COPY .env /app/.env"])
 
 
 def test_registry_release_retries_eventual_consistency_and_fails_on_ambiguity() -> None:
@@ -2875,6 +2923,64 @@ def test_layer_scan_detects_forbidden_member_deleted_by_later_whiteout() -> None
     message = str(caught.value)
     assert layer_blob_digest(forbidden) in message
     assert "app/restricted-tree/neutral.txt" in message
+
+
+def test_layer_scan_is_authoritative_for_generated_then_deleted_forbidden_files() -> None:
+    # The history entry is accepted because opaque shell text is not payload
+    # evidence; the earlier layer that wrote the restricted file still fails,
+    # even though a later layer removed it from the final filesystem.
+    metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
+    generated = layer_archive(
+        directory_member("."),
+        regular_member("app/tests/test_neutral.py", b"neutral\n"),
+    )
+    deleted = layer_archive(regular_member("app/.wh.tests"))
+    graph = release_graph(
+        metadata,
+        history=[{"created_by": "RUN rm -rf /app/tests"}],
+        runtime_layers={
+            "amd64": [
+                (verify.OCI_GZIP_LAYER_MEDIA_TYPE, generated),
+                (verify.OCI_GZIP_LAYER_MEDIA_TYPE, deleted),
+            ]
+        },
+    )
+    assert (
+        verify.assert_history_has_no_project_payload([{"created_by": "RUN rm -rf /app/tests"}])
+        is None
+    )
+    with pytest.raises(verify.VerificationError) as caught:
+        _verify_graph(metadata, graph)
+    message = str(caught.value)
+    assert layer_blob_digest(generated) in message
+    assert "app/tests/test_neutral.py" in message
+
+
+@pytest.mark.parametrize("forbidden_member", ["app/.env", "app/config.yaml", "app/state.session"])
+def test_layer_scan_detects_forbidden_file_whited_out_by_a_later_layer(
+    forbidden_member: str,
+) -> None:
+    metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
+    payload = layer_archive(regular_member(forbidden_member, b"neutral\n"))
+    directory, basename = forbidden_member.rsplit("/", 1)
+    whiteout = layer_archive(regular_member(f"{directory}/.wh.{basename}"))
+    history = [{"created_by": "RUN rm -f .env config.yaml state.session"}]
+    assert verify.assert_history_has_no_project_payload(history) is None
+    graph = release_graph(
+        metadata,
+        history=history,
+        runtime_layers={
+            "amd64": [
+                (verify.OCI_GZIP_LAYER_MEDIA_TYPE, payload),
+                (verify.OCI_GZIP_LAYER_MEDIA_TYPE, whiteout),
+            ]
+        },
+    )
+    with pytest.raises(verify.VerificationError) as caught:
+        _verify_graph(metadata, graph)
+    message = str(caught.value)
+    assert layer_blob_digest(payload) in message
+    assert forbidden_member in message
 
 
 @pytest.mark.parametrize(

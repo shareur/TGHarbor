@@ -200,14 +200,21 @@ present, and rejects missing, conflicting, or
 multiple source entries, wrong URIs or revisions, malformed structures, mixed legacy and
 `configSource` paths, and source or revision strings that appear only in build arguments
 or internal parameters. Record the image digest with the label values, then run the
-final-filesystem, configuration/history, and per-layer scans. The history scan is
-path-aware and command-context-aware: a runtime mount default such as
-`TGHARBOR_CONFIG=/config/config.yaml` is not a copied payload, and shell, linker, or
-printf escape syntax inherited from an upstream base image, such as
-`-Wl,-rpath='\$\$ORIGIN/../lib'` or `printf "*%s\n"`, is not a path separator. A copied
-`.env`, configuration file, test, Git, session, database, or log artifact, a Windows
-drive or UNC root, an unescaped backslash separator, and a URL with embedded credentials
-remain forbidden. The layer scan accepts only the canonical
+final-filesystem, configuration/history, and per-layer scans. The history scan rejects
+secrets: sensitive values, credential-bearing URLs, and sensitive `ENV`/`ARG` names,
+assignments, and unsafe runtime defaults. It also rejects payload paths only where the
+instruction semantics carry reliable intent, meaning exactly parsed `COPY`/`ADD` source
+and destination operands and `ENV`/`ARG` values. A runtime mount default such as
+`TGHARBOR_CONFIG=/config/config.yaml` is not a copied payload, while a copied `.env`,
+configuration file, test, Git, session, database, or log artifact remains forbidden.
+Opaque shell command text in Docker-generated history is not treated as payload
+evidence, because Docker records no reliable argument boundary for a base image's `RUN`
+commands; ordinary words such as `test`, `tests`, or `config.yaml`, and shell, linker, or
+printf escape syntax such as `-Wl,-rpath='\$\$ORIGIN/../lib'` or `printf "*%s\n"`, are
+not payloads. The per-layer archive scan is the authoritative forbidden-payload
+control: it inspects every layer independently, so a forbidden file that a later layer
+deletes, whitelists, or replaces, including an `.env` removed by `RUN rm`, still fails.
+The layer scan accepts only the canonical
 tar root directory marker `.`, requires directory metadata, rejects unsafe link or
 device metadata, and applies normalization, forbidden-name, traversal, absolute,
 backslash, link-target, and duplicate checks to every other member.
