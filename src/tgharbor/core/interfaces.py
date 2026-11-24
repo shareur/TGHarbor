@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
-from tgharbor.core.jobs import DownloadJob, JobStatus, NewDownloadJob, StoredFile
+from tgharbor.core.jobs import (
+    BatchNotice,
+    BatchProgress,
+    DownloadJob,
+    InteractionSession,
+    JobStatus,
+    NewDownloadJob,
+    StoredFile,
+)
 
 ProgressCallback = Callable[[int, int | None], Awaitable[None]]
 
@@ -17,6 +26,8 @@ class MediaDescriptor:
     total_bytes: int | None = None
     display_title: str | None = None
     mime_type: str | None = None
+    origin_group_id: str | None = None
+    channel_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,11 +52,35 @@ class JobQueue(Protocol):
         statuses: frozenset[JobStatus] | None = None,
     ) -> list[DownloadJob]: ...
 
+    async def list_paused_for_requester(
+        self,
+        requester_id: int,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> list[DownloadJob]: ...
+
+    async def count_paused_for_requester(self, requester_id: int) -> int: ...
+
+    async def continue_paused_for_requester(
+        self,
+        requester_id: int,
+        job_ids: Sequence[UUID] | None = None,
+        *,
+        now: float | None = None,
+    ) -> int: ...
+
+    async def batch_progress_for_requester(
+        self, requester_id: int, batch_id: str
+    ) -> BatchProgress | None: ...
+
     async def resolve_for_requester(
         self, requester_id: int, identifier: str
     ) -> DownloadJob | None: ...
 
-    async def claim_next(self, worker_id: str) -> DownloadJob | None: ...
+    async def claim_next(
+        self, worker_id: str, *, now: float | None = None
+    ) -> DownloadJob | None: ...
 
     async def update_progress(
         self, job_id: UUID, worker_id: str, current: int, total: int | None
@@ -60,6 +95,8 @@ class JobQueue(Protocol):
         original_file_name: str | None,
         mime_type: str | None,
         total_bytes: int | None,
+        origin_group_id: str | None = None,
+        channel_id: str | None = None,
     ) -> DownloadJob: ...
 
     async def reserve_name(
@@ -73,9 +110,22 @@ class JobQueue(Protocol):
         output_path: Path,
         *,
         relative_path: Path | None = None,
+        now: float | None = None,
+    ) -> DownloadJob: ...
+
+    async def mark_completed(
+        self,
+        job_id: UUID,
+        worker_id: str,
+        output_path: Path,
+        *,
+        relative_path: Path | None = None,
+        now: float | None = None,
     ) -> DownloadJob: ...
 
     async def list_files(self, *, limit: int = 10, offset: int = 0) -> list[StoredFile]: ...
+
+    async def list_files_for_batch(self, requester_id: int, batch_id: str) -> list[StoredFile]: ...
 
     async def fail_or_retry(
         self,
@@ -85,13 +135,72 @@ class JobQueue(Protocol):
         *,
         retryable: bool,
         retry_delay_seconds: float = 0,
+        now: float | None = None,
     ) -> DownloadJob: ...
 
     async def request_cancel(self, job_id: UUID, requester_id: int) -> DownloadJob: ...
 
     async def is_cancel_requested(self, job_id: UUID, worker_id: str) -> bool: ...
 
-    async def mark_cancelled(self, job_id: UUID, worker_id: str) -> DownloadJob: ...
+    async def mark_cancelled(
+        self, job_id: UUID, worker_id: str, *, now: float | None = None
+    ) -> DownloadJob: ...
+
+    async def claim_batch_notification(
+        self,
+        batch_id: str,
+        requester_id: int,
+        *,
+        claimed_by: str,
+        now: float | None = None,
+        stale_after_seconds: float = 300,
+    ) -> bool: ...
+
+    async def mark_batch_notification_sent(
+        self,
+        batch_id: str,
+        requester_id: int,
+        *,
+        claimed_by: str,
+        now: float | None = None,
+    ) -> bool: ...
+
+    async def list_claimable_batch_notifications(
+        self,
+        *,
+        now: float | None = None,
+        stale_after_seconds: float = 300,
+        limit: int = 20,
+    ) -> list[BatchNotice]: ...
+
+    async def ensure_batch_move_interaction(
+        self,
+        requester_id: int,
+        batch_id: str,
+        *,
+        expires_at: datetime,
+        now: float | None = None,
+    ) -> InteractionSession: ...
+
+    async def active_batch_move_interaction(
+        self, requester_id: int, batch_id: str
+    ) -> InteractionSession | None: ...
+
+    async def release_batch_notification(
+        self,
+        batch_id: str,
+        requester_id: int,
+        *,
+        claimed_by: str,
+        now: float | None = None,
+    ) -> bool: ...
+
+    async def recover_stale_batch_notifications(
+        self,
+        *,
+        now: float | None = None,
+        stale_after_seconds: float = 300,
+    ) -> int: ...
 
 
 class DownloadProvider(Protocol):

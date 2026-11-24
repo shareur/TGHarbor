@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from uuid import UUID
 
 from tgharbor.core.interfaces import JobQueue
-from tgharbor.core.jobs import DownloadJob, JobStatus, NewDownloadJob, SourceSession
+from tgharbor.core.jobs import (
+    BatchProgress,
+    DownloadJob,
+    JobStatus,
+    NewDownloadJob,
+    SourceSession,
+)
 
 
 class UnauthorizedUserError(PermissionError):
@@ -37,6 +43,10 @@ class JobAPI:
         source_message_id: int,
         *,
         destination_name: str | None = None,
+        batch_id: str | None = None,
+        batch_expected_size: int = 1,
+        origin_group_id: str | None = None,
+        channel_id: str | None = None,
     ) -> DownloadJob:
         self.require_authorized(requester_id)
         job = await self.queue.enqueue(
@@ -47,6 +57,10 @@ class JobAPI:
                 source_message_id=source_message_id,
                 destination_name=destination_name,
                 max_attempts=self.max_attempts,
+                batch_id=batch_id,
+                batch_expected_size=batch_expected_size,
+                origin_group_id=origin_group_id,
+                channel_id=channel_id,
             )
         )
         self.wake_workers()
@@ -75,6 +89,38 @@ class JobAPI:
             offset=offset,
             statuses=frozenset({JobStatus.PENDING, JobStatus.RUNNING}),
         )
+
+    async def paused(
+        self, requester_id: int, *, limit: int = 10, offset: int = 0
+    ) -> list[DownloadJob]:
+        self.require_authorized(requester_id)
+        return await self.queue.list_paused_for_requester(
+            requester_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def paused_count(self, requester_id: int) -> int:
+        self.require_authorized(requester_id)
+        return await self.queue.count_paused_for_requester(requester_id)
+
+    async def continue_paused(
+        self,
+        requester_id: int,
+        job_ids: Sequence[UUID] | None = None,
+    ) -> int:
+        self.require_authorized(requester_id)
+        changed = await self.queue.continue_paused_for_requester(requester_id, job_ids)
+        if changed:
+            self.wake_workers()
+        return changed
+
+    async def batch_progress(self, requester_id: int, batch_id: str) -> BatchProgress:
+        self.require_authorized(requester_id)
+        progress = await self.queue.batch_progress_for_requester(requester_id, batch_id)
+        if progress is None:
+            raise JobNotFoundError(batch_id)
+        return progress
 
     async def history(
         self,

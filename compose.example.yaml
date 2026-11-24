@@ -1,6 +1,9 @@
 services:
   tgharbor:
-    image: shareur/tgharbor:0.2.1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tgharbor:0.2.3
     container_name: tgharbor
     restart: unless-stopped
     init: true

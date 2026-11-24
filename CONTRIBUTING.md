@@ -12,9 +12,6 @@ self-hosted Core Downloader scope.
    acceptance criteria before implementation.
 4. Preserve requester ownership for jobs and shared authorization plus operator audit
    for library operations.
-5. Keep tracked and public documentation free of links to unpublished or untracked
-   project material and free of credentials, user content, private links, sessions,
-   databases, and logs.
 
 ## Development
 

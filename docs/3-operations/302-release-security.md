@@ -8,23 +8,18 @@ deployment identifiers as non-public data.
 
 ## Before the first public release
 
-1. Inspect the candidate tracked paths, working tree, index, ignored files, every local
-   and remote Git ref, and the candidate `git archive` with a dedicated secret scanner.
+1. Inspect the working tree, index, ignored files, every local and remote Git ref,
+   and all reachable blobs with a dedicated secret scanner.
 2. Compare known local credential values against Git objects without printing the
    values. A match requires credential rotation even if the file was later deleted.
 3. Confirm remote URLs contain no embedded credentials.
-4. From the exact candidate commit, build `git archive`, the sdist, and the wheel.
-   Confirm the candidate archive contains only intended tracked paths, then unpack and
-   scan each payload against the artifact contract below.
-5. Review the Docker build-context allowlist, then build the container and inspect its
-   final filesystem, configuration/history, and every layer for material outside the
-   published project tree, untracked material, configuration, sessions, databases,
-   downloaded content, and known credential values.
+4. From the exact candidate commit, build `git archive`, the sdist, and the wheel;
+   unpack and scan each payload against the artifact contract below.
+5. Build the container and inspect its file list and layers for configuration,
+   sessions, databases, downloaded content, and known credential values.
 6. Review generated Compose output without publishing expanded environment values.
-7. Validate public documentation links against the candidate archive and fail if a link
-   targets material outside the published project tree or untracked material. Run Ruff,
-   formatting, tests, dependency audit, documentation-link validation, and Gitleaks.
-   Resolve findings or document narrowly scoped false-positive allowlists.
+7. Run Ruff, formatting, tests, dependency audit, documentation-link validation, and
+   Gitleaks. Resolve findings or document narrowly scoped false-positive allowlists.
 8. Enable repository secret scanning, push protection, dependency alerts, and branch
    protection before accepting external contributions.
 
@@ -74,42 +69,16 @@ security controls.
 
 ## Container identity and provenance
 
-The portable Compose example pulls the published Docker Hub image
-`shareur/tgharbor:0.2.1`; it does not build locally. The `0.2.1` publication is recorded
-in the [Docker Hub repository](https://hub.docker.com/r/shareur/tgharbor) with aliases
-`0.2.1`, `0.2`, `latest`, and `sha-13c5bc7645b9` for `linux/amd64` and `linux/arm64`.
-The published `v0.2.1` release record identifies the multi-platform image index as
-`sha256:b40996ef4938f8545e5eaee86c91fc57b3d27f9b087353d02a97ae7548c5f560`, built
-from source revision `13c5bc7645b9ba27ea9837be3697fa1388ffb44d` and source
-`https://github.com/shareur/TGHarbor`. Tags remain mutable aliases and do not replace a
-recorded image digest. Stable aliases are published only after the exact tag-push `CI`
-run succeeds, with Buildx provenance and an SBOM recorded by the release workflow.
+The portable Compose example uses the exact release tag `tgharbor:0.2.3`. Tags remain
+mutable and do not replace a recorded image digest. The Dockerfile provides safe local
+defaults: version `0.2.3`, revision `uncommitted`, source `local`, and the Unix epoch
+created timestamp. Those revision, source, and created defaults identify a non-release
+build and are forbidden for a release image.
 
-The Dockerfile provides safe local defaults: version `0.2.1`, revision `uncommitted`,
-source `local`, and the Unix epoch created timestamp.
-Those revision, source, and created defaults identify a non-release build and are
-forbidden for a release image.
-
-Verify a pulled publication by comparing its resolved digest and OCI labels with the
-release record:
-
-```bash
-docker image inspect shareur/tgharbor:0.2.1 \
-  --format '{{index .RepoDigests 0}}'
-docker image inspect shareur/tgharbor:0.2.1 \
-  --format '{{json .Config.Labels}}'
-```
-
-The `RepoDigests` entry must resolve to the recorded index digest. Require
-`org.opencontainers.image.version=0.2.1`,
-`org.opencontainers.image.revision=13c5bc7645b9ba27ea9837be3697fa1388ffb44d`, and
-`org.opencontainers.image.source=https://github.com/shareur/TGHarbor`. A tag alias
-alone is not provenance.
-
-Build a release image from the clean immutable candidate. Set
-`TGHARBOR_IMAGE_SOURCE` to the verified project source URL without hardcoding an
-alternate source URL, and set `TGHARBOR_IMAGE_CREATED` once to the candidate build time
-in RFC 3339 UTC form. The full candidate commit is mandatory:
+Build the release image from the clean immutable candidate. Set
+`TGHARBOR_IMAGE_SOURCE` to the verified canonical public source URL without hardcoding
+a non-public source URL, and set `TGHARBOR_IMAGE_CREATED` once to the candidate build
+time in RFC 3339 UTC form. The full candidate commit is mandatory:
 
 ```bash
 CANDIDATE_COMMIT="$(git rev-parse HEAD)"
@@ -117,14 +86,14 @@ test -z "$(git status --porcelain)"
 test -n "$TGHARBOR_IMAGE_SOURCE"
 test -n "$TGHARBOR_IMAGE_CREATED"
 docker build --pull \
-  --build-arg TGHARBOR_IMAGE_VERSION=0.2.1 \
+  --build-arg TGHARBOR_IMAGE_VERSION=0.2.3 \
   --build-arg TGHARBOR_IMAGE_REVISION="$CANDIDATE_COMMIT" \
   --build-arg TGHARBOR_IMAGE_SOURCE="$TGHARBOR_IMAGE_SOURCE" \
   --build-arg TGHARBOR_IMAGE_CREATED="$TGHARBOR_IMAGE_CREATED" \
-  --tag tgharbor:0.2.1 .
+  --tag tgharbor:0.2.3 .
 ```
 
-Inspect the resulting OCI labels and require title `TGHarbor`, version `0.2.1`, the
+Inspect the resulting OCI labels and require title `TGHarbor`, version `0.2.3`, the
 exact candidate commit as revision, the verified public source, license `Apache-2.0`,
 and the supplied created timestamp. Record the image digest with the label values,
 then run the final-filesystem, configuration/history, and per-layer scans. Rebuild the
@@ -138,34 +107,15 @@ If a credential or session may have been exposed, revoke or rotate it first. His
 rewriting does not make a still-valid credential safe. Coordinate history rewriting
 with all repository users and rescan every ref afterward.
 
-## Source-only 0.2.2 maintenance release
-
-`v0.2.2` is a formatting-only source release. It applies Ruff formatting to the release
-validation scripts and release metadata tests so the repository-wide formatting check
-passes on the published source snapshot, and it aligns the project and runtime version
-metadata with `0.2.2`. It changes no runtime behavior, configuration, interface, or
-documented behavior.
-
-No container image is published for `0.2.2`. The recorded `0.2.1` image and its `0.2`,
-`latest`, and `sha-13c5bc7645b9` aliases remain the current image release, the index
-digest above stays unchanged, and Compose instructions and image examples continue to
-reference the published `0.2.1` image. Do not describe a `0.2.2` image as published, do
-not retag an existing image as `0.2.2`, and do not treat the `v0.2.2` tag as container
-provenance.
-
-The Docker release workflow re-validates the remote tag, the checkout version metadata,
-and the absence of every target Docker Hub tag before registry login. `0.2` and `latest`
-are already occupied by the recorded `0.2.1` image, so a `v0.2.2` tag run refuses to
-overwrite or move them and fails pre-push validation instead. That refusal is the
-expected outcome for a source-only release: it is neither a successful image publication
-nor a failure to repair, and the immutable `0.2.1` image tags must not be moved to make
-it pass.
-
 ## Continuous controls
 
 CI has read-only repository permissions, checks out complete history, pins Actions to
-immutable commit SHAs, runs dependency auditing, and scans secrets. Dependabot opens
-bounded weekly updates for Python, Actions, and Docker dependencies.
+immutable commit SHAs, runs dependency auditing, and scans secrets. It also runs
+`.github/scripts/verify_publication_boundary.py`, which fails the build on an unsafe
+tracked or reachable-history path, a public link that targets restricted or untracked
+material, a symbolic link in a public document or workflow, an artifact upload without
+an exact-member allowlist, or a build context that is not a deny-all allowlist.
+Dependabot opens bounded weekly updates for Python, Actions, and Docker dependencies.
 
 The secret scan installs the pinned Gitleaks CLI release `8.30.1` into
 `$RUNNER_TEMP` instead of running a marketplace Action, verifies the official
@@ -180,18 +130,14 @@ are printed with 100% redaction, no banner or color, and an exit code of `2`; a 
 fails the job as a secret incident, while any other non-zero exit is reported as an
 operational scanner failure and must never be described as a clean scan.
 
-CI must not upload a broad workspace, build-context, or history archive as an artifact.
-Publish only the exact release artifacts identified and verified for the candidate.
-
 Never paste secrets, session files, message contents, private links, database rows,
 or raw diagnostic objects into issues or pull requests. Security reports should use
-the confidential reporting process in `SECURITY.md` once a maintainer contact is
-published.
+the private process in `SECURITY.md` once a maintainer contact is published.
 
 ## Release record
 
 Record scanner versions and their pinned archive checksums, ref count, object count,
-image digest, candidate commit, artifact names, sizes, SHA-256 hashes, versions,
-commands, outcomes, false-positive decisions, and any rotations in the release record.
-Do not record the credential values, private hostnames, account IDs, or user-content
-paths.
+image digest, candidate commit,
+artifact names, sizes, SHA-256 hashes, versions, commands, outcomes, false-positive
+decisions, and any rotations in the release record. Do not record the credential
+values, private hostnames, account IDs, or user-content paths.

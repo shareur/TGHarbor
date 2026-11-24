@@ -9,9 +9,9 @@ may require upgrading rather than receiving a backport.
 
 Do not open a public issue containing exploit details, credentials, Telegram sessions,
 private links, user content, database rows, logs, or deployment identifiers. Until a
-dedicated security-reporting address is published, send only a minimal, non-sensitive
-notice through the hosting platform's confidential reporting channel for this project.
-The maintainer will provide a confidential path for details.
+private repository security-reporting channel is published, send only a minimal,
+non-sensitive notice to the repository owner through the hosting platform's private
+contact mechanism. The maintainer will provide a private path for details.
 
 Include affected version/commit, impact, prerequisites, and a sanitized reproduction.
 Do not test against accounts, Bots, hosts, or content you do not own or administer.

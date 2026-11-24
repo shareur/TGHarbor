@@ -15,18 +15,19 @@ v0.1 accepts work from authorized users in a private Bot conversation:
 Channel-history crawling, multi-message ranges, permission bypass, a web UI,
 distributed Workers, and guaranteed byte-range resume are out of scope.
 
-## Delivered outcomes
+## Implemented contracts
 
-- Authorized private-Bot requests and single-message links can be downloaded without
-  granting access to content the linked account cannot already see.
-- Accepted work and terminal results survive normal process restarts. Interrupted jobs
-  continue as new attempts, cancellation is honored, and retries remain bounded.
-- Job status, progress, cancellation, and terminal notifications are visible in the Bot.
-- Completed files stay below the configured local download root, and unsafe paths or
-  overwrite attempts are rejected. Interrupted partial bytes may be discarded.
-- Strict configuration rejects invalid values and keeps secrets out of rendered
-  objects. Local login authorizes the user session once.
-- The supplied container runs as a non-root user with persistent configuration, state,
+- Strict YAML configuration with environment overrides and redacted secret fields.
+- Local terminal user login with verification-code and optional two-step password
+  callbacks; unattended startup only reuses an authorized session.
+- Requester-scoped Job API and a versioned SQLite schema.
+- Atomic concurrent claiming, bounded attempts, delayed retries, flood-wait support,
+  cancellation, and restart recovery.
+- Asynchronous Worker pool with timeout, progress throttling, cancellation polling,
+  graceful shutdown, and Provider failure isolation.
+- Per-job local storage with path and symbolic-link defenses, temporary files,
+  atomic completion, and crash-window reconciliation.
+- Non-root Python 3.15 container configuration with persistent configuration, state,
   session, and download mounts.
 
 ## Automated acceptance
@@ -38,9 +39,11 @@ python -m ruff check .
 python -m pytest -q
 ```
 
-The suite uses fake Telegram clients and needs no credentials. It covers configuration
-handling, requester authorization, persistence and restart behavior, bounded retries and
-cancellation, provider routing, path and symbolic-link safety, Bot commands, and cleanup.
+The suite uses fake Telegram clients; it does not need or log credentials. It covers
+configuration errors and secret rendering, independent SQLite claimers, retry
+exhaustion, restart recovery, authorization and ownership, path traversal and
+symbolic links, write failure, Worker timeout/cancellation/shutdown, source-session
+routing, Bot commands, and application cleanup.
 
 ## Live acceptance
 

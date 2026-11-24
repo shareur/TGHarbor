@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
 from tgharbor.core.job_api import UnauthorizedUserError
-from tgharbor.core.jobs import LibraryStats, StoredFile
+from tgharbor.core.jobs import BatchProgress, FileLocation, LibraryStats, StoredFile
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +24,14 @@ class PendingOrganization:
 
 class LibraryRepository(Protocol):
     async def list_files(self, *, limit: int, offset: int) -> list[StoredFile]: ...
+
+    async def list_files_for_batch(self, requester_id: int, batch_id: str) -> list[StoredFile]: ...
+
+    async def batch_progress_for_requester(
+        self, requester_id: int, batch_id: str
+    ) -> BatchProgress | None: ...
+
+    async def archive_directory_recency(self) -> dict[str, float]: ...
 
     async def resolve_file(self, identifier: str) -> StoredFile | None: ...
 
@@ -65,6 +77,40 @@ class StoredFileNotFoundError(LookupError):
     """Raised when a shared stored-file identifier is absent or ambiguous."""
 
 
+class BatchNotFoundError(LookupError):
+    """Raised when a batch is absent inside the requester's authorization scope."""
+
+
+class BatchMoveCategory(StrEnum):
+    MOVED = "moved"
+    ALREADY_MOVED = "already-moved"
+    MISSING = "missing"
+    NOT_READY = "not-ready"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class BatchMoveItem:
+    job_id: UUID
+    category: BatchMoveCategory
+
+
+@dataclass(frozen=True, slots=True)
+class BatchMoveResult:
+    batch_id: str
+    total_members: int
+    moved: int
+    already_moved: int
+    missing: int
+    not_ready: int
+    failed: int
+    items: tuple[BatchMoveItem, ...]
+
+    @property
+    def complete(self) -> bool:
+        return self.missing == 0 and self.not_ready == 0 and self.failed == 0
+
+
 class LibraryAPI:
     def __init__(
         self,
@@ -86,7 +132,9 @@ class LibraryAPI:
 
     async def directories(self, actor_id: int) -> list[Path]:
         self.require_authorized(actor_id)
-        return await self.storage.list_archive_directories()
+        existing = await self.storage.list_archive_directories()
+        recency = await self.repository.archive_directory_recency()
+        return order_archive_directories(existing, recency)
 
     async def stats(self, actor_id: int) -> LibraryStats:
         self.require_authorized(actor_id)
@@ -98,6 +146,10 @@ class LibraryAPI:
         if stored is None:
             raise StoredFileNotFoundError(identifier)
         return stored
+
+    async def files_for_batch(self, actor_id: int, batch_id: str) -> list[StoredFile]:
+        self.require_authorized(actor_id)
+        return await self.repository.list_files_for_batch(actor_id, batch_id)
 
     async def organize(
         self,
@@ -129,14 +181,99 @@ class LibraryAPI:
             self.storage.root / relative,
             action=action,
         )
-        await self.storage.finish_organization(stored.job_id)
+        # The catalog move above is the committed effect. Removing the on-disk
+        # organization marker is cleanup: if it fails or is interrupted, startup
+        # reconciliation replays the same idempotent move without a duplicate
+        # audit row. Surfacing that cleanup failure as an organize failure would
+        # make the caller believe nothing committed and restore a duplicate
+        # confirmation.
+        try:
+            await self.storage.finish_organization(stored.job_id)
+        except Exception as error:  # noqa: BLE001 - reconciliation owns cleanup replay
+            logger.warning(
+                "Organization cleanup deferred: outcome=deferred error_type=%s",
+                type(error).__name__,
+            )
         return updated
+
+    async def organize_batch(
+        self,
+        actor_id: int,
+        batch_id: str,
+        target_directory: str,
+    ) -> BatchMoveResult:
+        """Move current Inbox members of one requester-owned batch.
+
+        Processing is deliberately per-file and idempotent. Already organized
+        or non-Inbox members are skipped; one failure does not roll back another
+        file. The result contains stable categories and identifiers, never
+        absolute filesystem paths.
+        """
+
+        self.require_authorized(actor_id)
+        progress = await self.repository.batch_progress_for_requester(actor_id, batch_id)
+        if progress is None:
+            raise BatchNotFoundError(batch_id)
+        files = await self.repository.list_files_for_batch(actor_id, batch_id)
+        items: list[BatchMoveItem] = []
+        moved = 0
+        already_moved = 0
+        missing = 0
+        failed = 0
+        for stored in files:
+            if stored.location is FileLocation.ARCHIVE:
+                already_moved += 1
+                items.append(BatchMoveItem(stored.job_id, BatchMoveCategory.ALREADY_MOVED))
+                continue
+            try:
+                updated = await self.organize(
+                    actor_id,
+                    stored.job_id.hex,
+                    archive_directory=target_directory,
+                )
+            except StoredFileNotFoundError:
+                missing += 1
+                items.append(BatchMoveItem(stored.job_id, BatchMoveCategory.MISSING))
+            except KeyError, OSError, RuntimeError, ValueError:
+                failed += 1
+                items.append(BatchMoveItem(stored.job_id, BatchMoveCategory.FAILED))
+            else:
+                if updated.location is FileLocation.ARCHIVE:
+                    moved += 1
+                    items.append(BatchMoveItem(stored.job_id, BatchMoveCategory.MOVED))
+                else:
+                    failed += 1
+                    items.append(BatchMoveItem(stored.job_id, BatchMoveCategory.FAILED))
+        missing += max(0, progress.completed - len(files))
+        not_ready = max(0, progress.total_jobs - progress.completed)
+        return BatchMoveResult(
+            batch_id=batch_id,
+            total_members=progress.total_jobs,
+            moved=moved,
+            already_moved=already_moved,
+            missing=missing,
+            not_ready=not_ready,
+            failed=failed,
+            items=tuple(items),
+        )
 
     async def mkdir(self, actor_id: int, directory: str) -> Path:
         self.require_authorized(actor_id)
         relative = await self.storage.create_archive_directory(directory)
         await self.repository.record_directory_creation(actor_id, relative)
         return relative
+
+
+def order_archive_directories(directories: list[Path], recency: dict[str, float]) -> list[Path]:
+    """Order existing directories by latest use, then case-insensitive name."""
+
+    def sort_key(directory: Path) -> tuple[bool, float, str, str]:
+        value = recency.get(directory.as_posix())
+        if value is None:
+            return (True, 0.0, directory.as_posix().casefold(), directory.as_posix())
+        return (False, -value, directory.as_posix().casefold(), directory.as_posix())
+
+    return sorted(directories, key=sort_key)
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,12 +4,17 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Final
 
 from tgharbor.core.errors import (
+    EXCEPTION_TYPE_NAME_FALLBACK,
     DownloadError,
     JobCancellationRequested,
+    PersistenceError,
+    download_error_detail,
+    safe_exception_type_name,
 )
 from tgharbor.core.interfaces import (
     DownloadProvider,
@@ -21,6 +26,10 @@ from tgharbor.core.interfaces import (
 from tgharbor.core.jobs import DownloadJob, SourceSession
 
 logger = logging.getLogger(__name__)
+
+# Repeated transient persistence failures of one fingerprint are logged once
+# immediately, then at most once per interval with only a suppressed count.
+PERSISTENCE_LOG_AGGREGATE_SECONDS: Final = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +86,8 @@ class DownloadWorker:
                     original_file_name=descriptor.file_name,
                     mime_type=descriptor.mime_type,
                     total_bytes=descriptor.total_bytes,
+                    origin_group_id=descriptor.origin_group_id,
+                    channel_id=descriptor.channel_id,
                 )
                 desired_name = self.storage.normalize_name(
                     job.destination_name or descriptor.file_name
@@ -90,7 +101,7 @@ class DownloadWorker:
                         target.final_path,
                         relative_path=self.storage.relative_path(target.final_path),
                     )
-                    await self._publish(completed)
+                    await self._publish(completed, worker_id)
                     return
                 progress = _ProgressReporter(
                     self.queue,
@@ -108,12 +119,12 @@ class DownloadWorker:
                     output,
                     relative_path=self.storage.relative_path(output),
                 )
-                await self._publish(completed)
+                await self._publish(completed, worker_id)
         except JobCancellationRequested:
             if target is not None:
                 await self.storage.discard(target)
             cancelled = await self.queue.mark_cancelled(job.id, worker_id)
-            await self._publish(cancelled)
+            await self._publish(cancelled, worker_id)
         except TimeoutError:
             if target is not None:
                 await self.storage.discard(target)
@@ -121,6 +132,12 @@ class DownloadWorker:
         except DownloadError as error:
             if target is not None:
                 await self.storage.discard(target)
+            logger.warning(
+                "Download failure %s while processing job %s on %s",
+                safe_exception_type_name(error, fallback=DownloadError.__name__),
+                job.id,
+                worker_id,
+            )
             await self._retry(
                 job,
                 worker_id,
@@ -134,11 +151,32 @@ class DownloadWorker:
             with contextlib.suppress(Exception):
                 await self._retry(job, worker_id, "worker stopped", retryable=True)
             raise
+        except PersistenceError as error:
+            # Log only the sanitized contract fields; never render a chained cause.
+            logger.error(
+                "Persistence failure category=%s error_type=%s code=%s while processing "
+                "job %s on %s",
+                error.category,
+                error.error_type,
+                error.code,
+                job.id,
+                worker_id,
+            )
+            if target is not None:
+                with contextlib.suppress(Exception):
+                    await self.storage.discard(target)
+            await self._retry(
+                job,
+                worker_id,
+                f"database {error.category}",
+                retryable=error.retryable,
+            )
         # A provider is an external adapter; isolate unknown adapter failures from the pool.
         except Exception as error:  # noqa: BLE001
+            error_type = safe_exception_type_name(error, fallback=EXCEPTION_TYPE_NAME_FALLBACK)
             logger.error(
                 "Unexpected %s while processing job %s",
-                error.__class__.__name__,
+                error_type,
                 job.id,
             )
             if target is not None:
@@ -147,7 +185,7 @@ class DownloadWorker:
             await self._retry(
                 job,
                 worker_id,
-                f"unexpected {error.__class__.__name__}",
+                f"unexpected {error_type}",
                 retryable=True,
             )
 
@@ -201,27 +239,137 @@ class DownloadWorker:
             retry_delay_seconds=max(backoff, retry_after_seconds) if retryable else 0,
         )
         if updated.is_terminal:
-            await self._publish(updated)
+            await self._publish(updated, worker_id)
 
-    async def _publish(self, job: DownloadJob) -> None:
+    async def _publish(self, job: DownloadJob, worker_id: str) -> None:
         if self.event_sink is None:
             return
         try:
             await self.event_sink.job_finished(job)
+        except PersistenceError as error:
+            logger.warning(
+                "Persistence notification failure category=%s error_type=%s code=%s for "
+                "job %s on %s",
+                error.category,
+                error.error_type,
+                error.code,
+                job.id,
+                worker_id,
+            )
         except Exception as error:  # noqa: BLE001 - notifications cannot change job state
             logger.warning(
                 "Ignoring %s while notifying for job %s",
-                error.__class__.__name__,
+                safe_exception_type_name(error, fallback=EXCEPTION_TYPE_NAME_FALLBACK),
                 job.id,
             )
 
 
+@dataclass(frozen=True, slots=True)
+class PersistenceLogEvent:
+    """A sanitized worker-pool persistence diagnostic.
+
+    Only the stable category, the bounded exception class name, the numeric code,
+    and an aggregate count are retained. Raw messages, causes, SQL, parameters,
+    paths, and provider or Telegram data are never stored.
+    """
+
+    kind: str
+    category: str
+    error_type: str
+    code: int | None
+    suppressed: int = 0
+
+    def render(self, worker_id: str) -> tuple[str, tuple[object, ...]]:
+        """Return a log template and its sanitized arguments."""
+
+        fingerprint: tuple[object, ...] = (worker_id, self.category, self.error_type, self.code)
+        if self.kind == "aggregate":
+            template = (
+                "Worker %s persistence failure continuing category=%s error_type=%s "
+                "code=%s suppressed=%d"
+            )
+            return template, (*fingerprint, self.suppressed)
+        if self.kind == "recovered":
+            template = (
+                "Worker %s persistence failure recovered category=%s error_type=%s "
+                "code=%s suppressed=%d"
+            )
+            return template, (*fingerprint, self.suppressed)
+        template = "Worker %s persistence failure category=%s error_type=%s code=%s"
+        return template, fingerprint
+
+
+class PersistenceFailureLogThrottle:
+    """Rate-limit repeated transient persistence diagnostics per fingerprint.
+
+    The first occurrence of a fingerprint is reported immediately. Identical
+    repeats are counted and reported at most once per ``aggregate_seconds`` with
+    only the suppressed count, and one recovery event is produced on the next
+    successful iteration. Time comes from an injectable monotonic clock so tests
+    are deterministic. Retry, backoff, and job semantics are untouched.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        aggregate_seconds: float = PERSISTENCE_LOG_AGGREGATE_SECONDS,
+    ) -> None:
+        if aggregate_seconds <= 0:
+            raise ValueError("aggregate_seconds must be positive")
+        self._clock = clock
+        self._aggregate_seconds = aggregate_seconds
+        self._fingerprint: tuple[str, str, int | None] | None = None
+        self._last_logged = 0.0
+        self._suppressed = 0
+
+    @property
+    def active_fingerprint(self) -> tuple[str, str, int | None] | None:
+        return self._fingerprint
+
+    def failure(self, error: PersistenceError) -> PersistenceLogEvent | None:
+        """Record one transient failure and return an event when it should log."""
+
+        fingerprint = (error.category, error.error_type, error.code)
+        now = self._clock()
+        if fingerprint != self._fingerprint:
+            self._fingerprint = fingerprint
+            self._last_logged = now
+            self._suppressed = 0
+            return PersistenceLogEvent("failure", *fingerprint)
+        if now - self._last_logged >= self._aggregate_seconds:
+            suppressed, self._suppressed = self._suppressed, 0
+            self._last_logged = now
+            return PersistenceLogEvent("aggregate", *fingerprint, suppressed=suppressed)
+        self._suppressed += 1
+        return None
+
+    def recovered(self) -> PersistenceLogEvent | None:
+        """Return one recovery event after a success, or ``None`` when healthy."""
+
+        fingerprint = self._fingerprint
+        if fingerprint is None:
+            return None
+        suppressed = self._suppressed
+        self._fingerprint = None
+        self._last_logged = 0.0
+        self._suppressed = 0
+        return PersistenceLogEvent("recovered", *fingerprint, suppressed=suppressed)
+
+
 class WorkerPool:
-    def __init__(self, worker: DownloadWorker, concurrency: int) -> None:
+    def __init__(
+        self,
+        worker: DownloadWorker,
+        concurrency: int,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         if concurrency <= 0:
             raise ValueError("concurrency must be positive")
         self.worker = worker
         self.concurrency = concurrency
+        self._clock = time.monotonic if clock is None else clock
         self._wake = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -244,8 +392,40 @@ class WorkerPool:
 
     async def _run_loop(self, index: int) -> None:
         worker_id = f"worker-{index}"
+        reported_permanent_failure: tuple[str, str, int | None] | None = None
+        transient_logs = PersistenceFailureLogThrottle(clock=self._clock)
         while True:
-            processed = await self.worker.run_once(worker_id)
+            try:
+                processed = await self.worker.run_once(worker_id)
+            except asyncio.CancelledError:
+                raise
+            except PersistenceError as error:
+                fingerprint = (error.category, error.error_type, error.code)
+                if error.retryable:
+                    # A transient failure keeps the existing retry and idle
+                    # cadence; only its diagnostics are rate limited.
+                    event = transient_logs.failure(error)
+                    if event is not None:
+                        message, arguments = event.render(worker_id)
+                        logger.error(message, *arguments)
+                    reported_permanent_failure = None
+                else:
+                    # A permanent failure cannot be fixed by re-claiming. Keep the
+                    # existing idle cadence but log only the first occurrence of an
+                    # identical permanent fingerprint so the loop cannot flood logs.
+                    if fingerprint != reported_permanent_failure:
+                        message, arguments = PersistenceLogEvent("failure", *fingerprint).render(
+                            worker_id
+                        )
+                        logger.error(message, *arguments)
+                    reported_permanent_failure = fingerprint
+                processed = False
+            else:
+                reported_permanent_failure = None
+                recovery = transient_logs.recovered()
+                if recovery is not None:
+                    message, arguments = recovery.render(worker_id)
+                    logger.info(message, *arguments)
             if processed:
                 continue
             self._wake.clear()
@@ -291,6 +471,5 @@ class _ProgressReporter:
         self._last_written = now
 
 
-def _safe_error(error: BaseException) -> str:
-    text = " ".join(str(error).split()) or error.__class__.__name__
-    return text[:500]
+def _safe_error(error: DownloadError) -> str:
+    return download_error_detail(error)

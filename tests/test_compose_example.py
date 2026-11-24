@@ -13,8 +13,7 @@ def test_compose_example_uses_portable_docker_managed_volumes() -> None:
     service = document["services"]["tgharbor"]
 
     assert "user" not in service
-    assert "build" not in service
-    assert service["image"] == "shareur/tgharbor:0.2.1"
+    assert service["image"] == "tgharbor:0.2.3"
     assert service["env_file"] == [{"path": ".env", "required": False}]
 
     mounts = {mount["target"]: mount for mount in service["volumes"]}

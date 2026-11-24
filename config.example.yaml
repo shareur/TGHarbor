@@ -37,5 +37,6 @@ sessions:
   path: ./data/sessions
 
 logging:
-  # One of CRITICAL, ERROR, WARNING, INFO, or DEBUG.
+  # One of CRITICAL, ERROR, WARNING, INFO, or DEBUG. Applies to TGHarbor's own
+  # loggers; the Telethon library namespace is always limited to ERROR or stricter.
   level: INFO
