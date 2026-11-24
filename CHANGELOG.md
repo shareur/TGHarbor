@@ -4,6 +4,44 @@ This project follows a Keep a Changelog style while it remains pre-1.0.
 
 ## Unreleased
 
+### Added
+
+- Read-only `Docker image verification` workflow (`.github/workflows/docker-verify.yml`)
+  and a `verify-existing` release-contract mode for an already published immutable
+  image. The workflow is manually dispatchable for a stable tag, has read-only
+  repository permissions, no Docker Hub secrets or environment, checks out the
+  verifier from the exact protected default-branch commit, discovers the immutable
+  index digest anonymously, requires the four expected tags to converge, and runs only
+  existing-image verification. It never logs in, builds, pushes, retags, deletes, or
+  mutates a registry or GitHub ref.
+
+### Fixed
+
+- The Docker release verifier now scans image history by path and command context
+  instead of broad substrings, so the legitimate runtime default
+  `TGHARBOR_CONFIG=/config/config.yaml` is allowed while copied secrets, configuration
+  files, tests, Git material, sessions, databases, logs, and sensitive environment
+  values remain rejected.
+- Layer scanning accepts only the canonical tar root directory marker `.` with
+  directory metadata and rejects non-directory or duplicate root markers, unsafe link
+  or device metadata, and dot components that would bypass normalization, forbidden
+  name, traversal, absolute path, backslash, or link-target checks.
+- Provenance verification supports the BuildKit SLSA v1 shape observed from the
+  published image, binding
+  `predicate.buildDefinition.externalParameters.configSource` and
+  `predicate.buildDefinition.resolvedDependencies` to one canonical source URI and
+  revision, binding the resolved Git dependency primarily through `digest.gitCommit`
+  with `digest.sha1` accepted only as a compatible alias, while rejecting conflicting,
+  multiple, malformed, build-argument-only, or mixed legacy source shapes.
+
+### Notes
+
+- These corrections enable verification-only recovery for an image whose immutable
+  tag and digest already exist. They do not move `v0.2.3`, change schema 4 or version
+  `0.2.3`, alter the Dockerfile or image contents, or publish another image. No
+  existing-image verification run has been executed yet, so no recovery or release
+  success is claimed.
+
 ## 0.2.3 - 2026-11-24
 
 This release changes the public release line substantially relative to the published

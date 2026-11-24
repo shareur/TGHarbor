@@ -15,6 +15,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -108,17 +109,38 @@ FORBIDDEN_SUFFIXES = (".session", ".session-journal", ".db", ".sqlite", ".sqlite
 _FORBIDDEN_BASENAMES_CASEFOLD = frozenset(name.casefold() for name in FORBIDDEN_BASENAMES)
 _FORBIDDEN_DIRECTORIES_CASEFOLD = frozenset(name.casefold() for name in FORBIDDEN_DIRECTORY_NAMES)
 _FORBIDDEN_RELATIVE_PATHS_CASEFOLD = frozenset(path.casefold() for path in FORBIDDEN_RELATIVE_PATHS)
-FORBIDDEN_HISTORY_MARKERS = (
-    ".env",
-    "config.yaml",
-    "config.yml",
-    "compose.yaml",
-    "compose.yml",
-    "/tests/",
-    "/.git/",
-    ".session",
-    ".sqlite",
+# Published runtime layers carry the root directory member as ``.`` (observed in
+# the prior published-layer evidence). ``tarfile`` serializes a directory as a
+# trailing-slash header and strips that slash when parsing, so a serialized
+# ``./`` directory is returned as ``.`` and any non-canonical form that survives
+# parsing (such as ``./.``) is rejected by path normalization.
+LAYER_ROOT_DIRECTORY_MARKER = "."
+# Runtime container mounts are not build-context payloads. A Dockerfile may set a
+# runtime configuration path default such as ``/config/config.yaml`` without
+# copying that file into the image.
+RUNTIME_MOUNT_PREFIXES = ("/config/", "/data/", "/downloads/")
+RUNTIME_CONFIG_BASENAMES = frozenset({"config.yaml", "config.yml"})
+SENSITIVE_ENVIRONMENT_NAME_PARTS = (
+    "api_hash",
+    "api-hash",
+    "apihash",
+    "bot_token",
+    "bot-token",
+    "credential",
+    "passwd",
+    "password",
+    "phone",
+    "private_key",
+    "private-key",
+    "secret",
+    "session",
+    "token",
 )
+SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"[0-9]{7,12}:[A-Za-z0-9_-]{30,}"),
+    re.compile(r"(?i)(?:api[_-]?hash|bot[_-]?token|password|secret|token)\s*[=:]\s*\S+"),
+)
+HISTORY_EXCLUDED_DIRECTORY_NAMES = frozenset({".git", "tests"})
 
 REQUIRED_LABELS = {
     "org.opencontainers.image.title": "TGHarbor",
@@ -439,6 +461,145 @@ def validate_release_labels(labels: Mapping[str, Any], metadata: ReleaseMetadata
         raise VerificationError("source label does not match the verified project source")
 
 
+def _history_tokens(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        tokens = command.split()
+    return [token for token in tokens if token and not token.startswith("#")]
+
+
+def _history_path_problem(value: str, *, allow_runtime_mounts: bool) -> str | None:
+    """Return a payload reason for one history path token.
+
+    The check is path-aware rather than substring-based: the legitimate runtime
+    default ``TGHARBOR_CONFIG=/config/config.yaml`` is a mount path, while a
+    copied ``.env``, ``config.yaml``, test, Git, session, database, or log path
+    remains a forbidden payload.
+    """
+
+    candidate = value.strip().strip("\"'`()[]{};,")
+    if not candidate or candidate.startswith(("-", "#")):
+        return None
+    if "://" in candidate and not candidate.startswith(("/", "./", "../")):
+        return None
+    if "\\" in candidate:
+        return "history path contains an ambiguous backslash"
+    normalized = candidate
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.rstrip("/")
+    if normalized in {"", "."}:
+        return None
+    if normalized == "..":
+        return "history path traverses outside its root"
+    if normalized.startswith("//"):
+        return "history path is an ambiguous absolute path"
+    absolute = normalized.startswith("/") or WINDOWS_DRIVE_PATTERN.match(normalized) is not None
+    if (
+        absolute
+        and allow_runtime_mounts
+        and any(
+            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+            for prefix in RUNTIME_MOUNT_PREFIXES
+        )
+        and normalized.rsplit("/", 1)[-1].casefold() in RUNTIME_CONFIG_BASENAMES
+    ):
+        return None
+    parts = tuple(part.casefold() for part in normalized.split("/") if part)
+    if not parts:
+        return None
+    if any(part == ".." for part in parts):
+        return "history path traverses outside its root"
+    if any(part in HISTORY_EXCLUDED_DIRECTORY_NAMES for part in parts):
+        return "history references excluded development material"
+    basename = parts[-1]
+    if basename in _FORBIDDEN_BASENAMES_CASEFOLD:
+        return "history references a restricted, configuration, or development file"
+    if basename.endswith(FORBIDDEN_SUFFIXES):
+        return "history references a user-state file suffix"
+    return None
+
+
+def _history_assignment_problem(token: str) -> str | None:
+    candidate = token.strip("\"'`;,")
+    if "=" not in candidate:
+        return None
+    key, value = candidate.split("=", 1)
+    key = key.lstrip("-").strip()
+    if not key:
+        return None
+    lowered_key = key.casefold()
+    if any(part in lowered_key for part in SENSITIVE_ENVIRONMENT_NAME_PARTS):
+        return "history sets a sensitive environment variable name"
+    for pattern in SENSITIVE_VALUE_PATTERNS:
+        if pattern.search(candidate):
+            return "history sets a sensitive environment variable value"
+    return _history_path_problem(value, allow_runtime_mounts=True)
+
+
+def _history_command_problem(value: str) -> str | None:
+    tokens = _history_tokens(value)
+    index = 0
+    instruction_keywords = {
+        "ADD",
+        "ARG",
+        "CMD",
+        "COPY",
+        "ENTRYPOINT",
+        "ENV",
+        "LABEL",
+        "RUN",
+        "USER",
+        "WORKDIR",
+    }
+    while index < len(tokens):
+        token = tokens[index]
+        upper = token.upper()
+        if upper in {"COPY", "ADD"}:
+            sources: list[str] = []
+            cursor = index + 1
+            while cursor < len(tokens):
+                candidate = tokens[cursor]
+                if candidate.upper() in instruction_keywords:
+                    break
+                cursor += 1
+                sources.append(candidate)
+            if len(sources) >= 2:
+                for source in sources[:-1]:
+                    problem = _history_path_problem(source, allow_runtime_mounts=False)
+                    if problem is not None:
+                        return problem
+            index = cursor
+            continue
+        if upper in {"ENV", "ARG"}:
+            cursor = index + 1
+            while cursor < len(tokens):
+                candidate = tokens[cursor]
+                if candidate.upper() in instruction_keywords:
+                    break
+                cursor += 1
+                if candidate.startswith("-"):
+                    continue
+                problem = _history_assignment_problem(candidate)
+                if problem is not None:
+                    return problem
+                if "=" not in candidate and any(
+                    part in candidate.casefold() for part in SENSITIVE_ENVIRONMENT_NAME_PARTS
+                ):
+                    return "history sets a sensitive environment variable name"
+            index = cursor
+            continue
+        problem = _history_assignment_problem(token)
+        if problem is not None:
+            return problem
+        problem = _history_path_problem(token, allow_runtime_mounts=True)
+        if problem is not None:
+            return problem
+        index += 1
+    return None
+
+
 def assert_history_has_no_project_payload(history: object) -> None:
     entries = _require_list(history, label="image history")
     for entry in entries:
@@ -447,12 +608,10 @@ def assert_history_has_no_project_payload(history: object) -> None:
             value = entry_map.get(key)
             if not isinstance(value, str):
                 continue
-            lowered = value.lower()
-            for marker in FORBIDDEN_HISTORY_MARKERS:
-                if marker in lowered:
-                    raise VerificationError(
-                        "image history references a forbidden project payload name"
-                    )
+            if _history_command_problem(value) is not None:
+                raise VerificationError(
+                    f"image history references a forbidden project payload name ({key})"
+                )
 
 
 def _forbidden_layer_path_reason(
@@ -549,6 +708,28 @@ def _inspect_layer_member(
 ) -> None:
     """Reject one unsafe or forbidden layer member using metadata only."""
 
+    if member.name == LAYER_ROOT_DIRECTORY_MARKER:
+        if not member.isdir() or member.issym() or member.islnk():
+            raise VerificationError(
+                f"runtime layer {layer_digest} member .: canonical root marker must be a directory"
+            )
+        if member.linkname:
+            raise VerificationError(
+                f"runtime layer {layer_digest} member .: root marker must not be a link"
+            )
+        if member.size != 0 or member.devmajor != 0 or member.devminor != 0:
+            raise VerificationError(
+                f"runtime layer {layer_digest} member .: root marker has invalid directory metadata"
+            )
+        return
+    # Parsing a serialized ``./`` directory normalizes the name to ``.``, so this
+    # guard is unreachable through ``inspect_layer_archive`` and protects direct
+    # metadata callers only. Forms that survive parsing, such as ``./.``, are
+    # rejected by the normalization checks below.
+    if member.name == "./":
+        raise VerificationError(
+            f"runtime layer {layer_digest} member ./: non-canonical root directory marker"
+        )
     normalized, path_reason = _normalize_layer_member_path(member.name)
     if path_reason is not None:
         raise VerificationError(f"runtime layer {layer_digest} member {normalized}: {path_reason}")
@@ -614,7 +795,15 @@ def inspect_layer_archive(
     mode = "r:gz" if compressed else "r:"
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode=mode) as archive:
+            seen_root_marker = False
             for member in archive.getmembers():
+                if member.name == LAYER_ROOT_DIRECTORY_MARKER:
+                    if seen_root_marker:
+                        raise VerificationError(
+                            f"runtime layer {digest} member .: "
+                            "duplicate canonical root directory marker"
+                        )
+                    seen_root_marker = True
                 _inspect_layer_member(digest, member, policy)
     except VerificationError:
         raise
@@ -794,18 +983,122 @@ def statement_binds_subject(statement: Mapping[str, Any], subject_digest: str) -
     return False
 
 
+def _canonical_source_uri_key(uri: object) -> str | None:
+    """Return a comparable canonical source key for a BuildKit source URI."""
+
+    if not isinstance(uri, str) or CANONICAL_SOURCE_PATTERN.fullmatch(uri) is None:
+        return None
+    value = uri.removeprefix("git+")
+    value = value.split("#", 1)[0]
+    value = value.removesuffix(".git")
+    return value.rstrip("/").casefold()
+
+
+def _source_digest_sha1(source: Mapping[str, Any], metadata: ReleaseMetadata) -> str | None:
+    """Return the exact ``digest.sha1`` binding required of a config source."""
+
+    digest = source.get("digest")
+    if not isinstance(digest, Mapping):
+        return None
+    sha1 = digest.get("sha1")
+    if not isinstance(sha1, str) or sha1 != metadata.sha:
+        return None
+    return sha1
+
+
+def _dependency_digest_matches_revision(digest: object, metadata: ReleaseMetadata) -> bool:
+    """Bind one resolved Git dependency to the release revision.
+
+    Real BuildKit output records the resolved Git commit as
+    ``digest.gitCommit``; that field is authoritative. ``digest.sha1`` is
+    accepted only as a compatible alias when ``gitCommit`` is absent, and when
+    both fields are present they must name the same revision.
+    """
+
+    if not isinstance(digest, Mapping):
+        return False
+    git_commit = digest.get("gitCommit")
+    sha1 = digest.get("sha1")
+    if git_commit is None:
+        return isinstance(sha1, str) and sha1 == metadata.sha
+    if not isinstance(git_commit, str) or git_commit != metadata.sha:
+        return False
+    if sha1 is None:
+        return True
+    return isinstance(sha1, str) and sha1 == git_commit
+
+
+def _config_source_ref_matches(source: Mapping[str, Any], metadata: ReleaseMetadata) -> bool:
+    """Bind the optional ``configSource.ref`` to the release identity."""
+
+    ref = source.get("ref")
+    if ref is None:
+        return True
+    if not isinstance(ref, str):
+        return False
+    return ref in {metadata.tag, f"refs/tags/{metadata.tag}", metadata.sha}
+
+
+def _resolved_dependency_source_key(
+    dependencies: object, metadata: ReleaseMetadata
+) -> tuple[str, str | None]:
+    """Classify the canonical Git source entry in ``resolvedDependencies``.
+
+    Returns ``("absent", None)`` when no canonical project repository entry is
+    present, ``("invalid", None)`` when the list is malformed, ambiguous, or
+    binds the wrong revision, and ``("ok", key)`` for exactly one canonical
+    source entry whose ``digest.gitCommit`` (or compatible ``digest.sha1``
+    alias) equals the release SHA.
+    """
+
+    if dependencies is None:
+        return "absent", None
+    if not isinstance(dependencies, list):
+        return "invalid", None
+    keys: set[str] = set()
+    canonical_entries = 0
+    for dependency in dependencies:
+        if not isinstance(dependency, Mapping):
+            return "invalid", None
+        uri = dependency.get("uri")
+        if not isinstance(uri, str):
+            return "invalid", None
+        key = _canonical_source_uri_key(uri)
+        if key is None:
+            continue
+        canonical_entries += 1
+        if canonical_entries > 1:
+            return "invalid", None
+        if not _dependency_digest_matches_revision(dependency.get("digest"), metadata):
+            return "invalid", None
+        keys.add(key)
+    if not keys:
+        return "absent", None
+    if len(keys) != 1:
+        return "invalid", None
+    return "ok", keys.pop()
+
+
 def _provenance_source_identity(
     statement: Mapping[str, Any], metadata: ReleaseMetadata
 ) -> tuple[str, str] | None:
     """Return the exact BuildKit source URI and commit bound by provenance.
 
-    BuildKit SLSA v1 provenance normally emits the source under
-    ``predicate.buildDefinition.externalParameters.source``. The alternate typed
-    ``predicate.buildDefinition.externalParameters.config.source`` path is
-    accepted only for fail-closed compatibility. Either way the URI and ``sha1``
-    must be reachable only through that typed structure, a statement carrying
-    both paths is rejected, and unrelated build arguments or nested strings
-    cannot satisfy the binding.
+    BuildKit SLSA v1 provenance emitted by the published image carries the Git
+    source under ``predicate.buildDefinition.externalParameters.configSource``
+    and repeats the Git source/revision binding in
+    ``predicate.buildDefinition.resolvedDependencies``. Both structures must
+    name one canonical source URI and bind the release SHA. The
+    ``configSource`` uses ``digest.sha1``; the resolved dependency is bound
+    primarily through ``digest.gitCommit`` with ``digest.sha1`` accepted only
+    as a compatible alias when ``gitCommit`` is absent. When both dependency
+    digest fields are present they must agree.
+
+    The older ``externalParameters.source`` and
+    ``externalParameters.config.source`` paths are accepted only as validated
+    compatibility shapes. Mixing a ``configSource`` with either legacy path,
+    supplying multiple or conflicting dependency sources, malformed structures,
+    wrong URIs or revisions, or build-argument-only strings fails closed.
     """
 
     predicate_type = statement.get("predicateType")
@@ -820,28 +1113,57 @@ def _provenance_source_identity(
     external = build_definition.get("externalParameters")
     if not isinstance(external, Mapping):
         return None
-    candidates: list[Any] = []
+
+    legacy_candidates: list[Any] = []
     direct = external.get("source")
     if direct is not None:
-        candidates.append(direct)
+        legacy_candidates.append(direct)
     config = external.get("config")
     if isinstance(config, Mapping) and config.get("source") is not None:
-        candidates.append(config["source"])
-    if len(candidates) != 1:
+        legacy_candidates.append(config["source"])
+
+    config_source = external.get("configSource")
+    if config_source is not None:
+        if legacy_candidates:
+            return None
+        if not isinstance(config_source, Mapping):
+            return None
+        uri = config_source.get("uri")
+        key = _canonical_source_uri_key(uri)
+        if key is None:
+            return None
+        sha1 = _source_digest_sha1(config_source, metadata)
+        if sha1 is None:
+            return None
+        if not _config_source_ref_matches(config_source, metadata):
+            return None
+        dependency_status, dependency_key = _resolved_dependency_source_key(
+            build_definition.get("resolvedDependencies"), metadata
+        )
+        if dependency_status != "ok" or dependency_key != key:
+            return None
+        return str(uri), sha1
+
+    if len(legacy_candidates) != 1:
         return None
-    source = candidates[0]
+    source = legacy_candidates[0]
     if not isinstance(source, Mapping):
         return None
     uri = source.get("uri")
-    digest = source.get("digest")
-    if not isinstance(uri, str) or CANONICAL_SOURCE_PATTERN.fullmatch(uri) is None:
+    key = _canonical_source_uri_key(uri)
+    if key is None:
         return None
-    if not isinstance(digest, Mapping):
+    sha1 = _source_digest_sha1(source, metadata)
+    if sha1 is None:
         return None
-    sha1 = digest.get("sha1")
-    if not isinstance(sha1, str) or sha1 != metadata.sha:
+    if not _config_source_ref_matches(source, metadata):
         return None
-    return uri, sha1
+    dependency_status, dependency_key = _resolved_dependency_source_key(
+        build_definition.get("resolvedDependencies"), metadata
+    )
+    if dependency_status == "invalid" or (dependency_status == "ok" and dependency_key != key):
+        return None
+    return str(uri), sha1
 
 
 def provenance_binds_source_and_revision(

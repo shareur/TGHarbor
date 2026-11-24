@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import verify_docker_release as image_registry
+from publication_policy import EMPTY_POLICY, ForbiddenPathPolicy, policy_from_environment
 from release_contract import (
     CANONICAL_DEFAULT_BRANCH,
     CANONICAL_REPOSITORY,
@@ -866,6 +867,11 @@ def _api_from_environment(environ: Mapping[str, str]) -> GitHubApi:
     return GitHubApi(environ.get("GITHUB_TOKEN"))
 
 
+def _anonymous_api_from_environment(environ: Mapping[str, str]) -> GitHubApi:
+    del environ
+    return GitHubApi(None)
+
+
 def _hub_from_environment(environ: Mapping[str, str]) -> DockerHubTags:
     del environ
     return DockerHubTags()
@@ -951,6 +957,140 @@ def _pre_push_command(
     return metadata
 
 
+def _write_existing_resolution_outputs(
+    path: object,
+    *,
+    tag: str,
+    sha: str,
+    default_branch_sha: str,
+) -> None:
+    semver = parse_stable_tag(tag)
+    write_github_outputs(
+        path,
+        {
+            "release_tag": tag,
+            "release_sha": require_full_sha(sha),
+            "default_branch_sha": require_full_sha(
+                default_branch_sha, label="default branch commit"
+            ),
+            "release_version": semver.version,
+            "minor_tag": semver.minor_version,
+            "latest_tag": LATEST_TAG,
+            "sha_tag": f"sha-{sha[:12]}",
+        },
+    )
+
+
+def _write_existing_verification_outputs(
+    path: object,
+    metadata: ReleaseMetadata,
+    result: image_registry.ReleaseVerification,
+) -> None:
+    write_github_outputs(
+        path,
+        {
+            "release_tag": metadata.tag,
+            "release_version": metadata.version,
+            "release_sha": metadata.sha,
+            "minor_tag": metadata.minor_version,
+            "latest_tag": LATEST_TAG,
+            "sha_tag": metadata.sha_tag,
+            "image_created": metadata.created,
+            "image_source": metadata.source,
+            "image_digest": result.digest,
+            "amd64_digest": result.images["linux/amd64"].digest,
+            "arm64_digest": result.images["linux/arm64"].digest,
+            "amd64_config_digest": result.images["linux/amd64"].config_digest,
+            "arm64_config_digest": result.images["linux/arm64"].config_digest,
+            "attestation_count": len(result.attestation_digests),
+        },
+    )
+
+
+def _resolve_existing_command(
+    *,
+    release_tag: str,
+    output_path: object,
+    api: JsonApi,
+) -> RemoteTag:
+    """Resolve a published annotated tag without reading or writing the registry."""
+
+    remote = resolve_remote_tag(api, release_tag)
+    default_branch_sha = assert_default_branch_reachability(api, remote.commit_sha)
+    _write_existing_resolution_outputs(
+        output_path,
+        tag=remote.tag,
+        sha=remote.commit_sha,
+        default_branch_sha=default_branch_sha,
+    )
+    return remote
+
+
+def _discover_existing_digest(registry: image_registry.Registry, metadata: ReleaseMetadata) -> str:
+    """Discover the immutable index digest anonymously and require alias convergence."""
+
+    try:
+        version_manifest = registry.get_manifest(metadata.version)
+        sha_manifest = registry.get_manifest(metadata.sha_tag)
+        alias_manifests = [registry.get_manifest(alias) for alias in metadata.mutable_image_tags]
+    except image_registry.RegistryNotFound as exc:
+        raise ValidationError(
+            "the immutable version or sha-* tag, or a required mutable alias, does not exist"
+        ) from exc
+    except image_registry.RegistryError as exc:
+        raise ValidationError("Docker Hub could not resolve the existing image identity") from exc
+    digest = require_digest(version_manifest.digest, label="immutable image digest")
+    if sha_manifest.digest != digest:
+        raise ValidationError(
+            "the immutable version and sha-* tags do not resolve to the same image digest"
+        )
+    for alias, manifest in zip(metadata.mutable_image_tags, alias_manifests, strict=True):
+        if manifest.digest != digest:
+            raise ValidationError(f"mutable alias {alias} diverges from the immutable image digest")
+    return digest
+
+
+def _verify_existing_command(
+    *,
+    release_tag: str,
+    release_sha: str,
+    checkout: object,
+    expected_digest: str | None,
+    output_path: object,
+    api: JsonApi,
+    registry: image_registry.Registry,
+    retry_attempts: int = 12,
+    retry_delay: float = 10.0,
+    sleep: Callable[[float], None] = time.sleep,
+    policy: ForbiddenPathPolicy = EMPTY_POLICY,
+) -> tuple[ReleaseMetadata, image_registry.ReleaseVerification]:
+    """Verify an already published immutable image without any publication step."""
+
+    remote = resolve_remote_tag(api, release_tag)
+    if remote.commit_sha != require_full_sha(release_sha):
+        raise ValidationError("remote peeled tag SHA changed before existing-image verification")
+    assert_default_branch_reachability(api, remote.commit_sha)
+    metadata = verify_release_checkout(checkout, expected_tag=release_tag, expected_sha=release_sha)
+    digest = _discover_existing_digest(registry, metadata)
+    expected = (expected_digest or "").strip()
+    if expected and digest != require_digest(expected, label="expected existing image digest"):
+        raise ValidationError(
+            "the existing immutable image digest does not match the expected digest"
+        )
+    result = image_registry.verify_registry_release(
+        registry,
+        tags=metadata.image_tags,
+        expected_digest=digest,
+        metadata=metadata,
+        retry_attempts=retry_attempts,
+        retry_delay=retry_delay,
+        sleep=sleep,
+        policy=policy,
+    )
+    _write_existing_verification_outputs(output_path, metadata, result)
+    return metadata, result
+
+
 def _build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate a TGHarbor Docker Hub release request before login."
@@ -983,6 +1123,25 @@ def _build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
     pre_push.add_argument("--checkout", required=True)
     pre_push.add_argument("--release-tag", required=True)
     pre_push.add_argument("--release-sha", required=True)
+
+    resolve_existing = subparsers.add_parser(
+        "resolve-existing",
+        help="resolve an already published annotated tag without registry access",
+    )
+    add_common(resolve_existing)
+    resolve_existing.add_argument("--release-tag", required=True)
+
+    verify_existing = subparsers.add_parser(
+        "verify-existing",
+        help="verify an existing immutable image without building, pushing, or logging in",
+    )
+    add_common(verify_existing)
+    verify_existing.add_argument("--checkout", required=True)
+    verify_existing.add_argument("--release-tag", required=True)
+    verify_existing.add_argument("--release-sha", required=True)
+    verify_existing.add_argument("--expected-digest", default=None)
+    verify_existing.add_argument("--retry-attempts", type=int, default=12)
+    verify_existing.add_argument("--retry-delay", type=float, default=10.0)
     return parser
 
 
@@ -1038,6 +1197,35 @@ def main(
             print(
                 f"Pre-push validation passed for {metadata.tag}; immutable tags are absent "
                 "and mutable aliases are absent or bound to a verified forward-only image."
+            )
+            return 0
+        if arguments.command == "resolve-existing":
+            remote = _resolve_existing_command(
+                release_tag=arguments.release_tag,
+                output_path=arguments.output,
+                api=_anonymous_api_from_environment(environment),
+            )
+            print(
+                f"Resolved existing annotated tag {remote.tag} to {remote.commit_sha} "
+                "on the protected default branch."
+            )
+            return 0
+        if arguments.command == "verify-existing":
+            metadata, result = _verify_existing_command(
+                release_tag=arguments.release_tag,
+                release_sha=arguments.release_sha,
+                checkout=arguments.checkout,
+                expected_digest=arguments.expected_digest,
+                output_path=arguments.output,
+                api=_anonymous_api_from_environment(environment),
+                registry=image_registry_factory(environment),
+                retry_attempts=arguments.retry_attempts,
+                retry_delay=arguments.retry_delay,
+                policy=policy_from_environment(environment),
+            )
+            print(
+                f"Verified existing immutable image {metadata.tag} at {result.digest} "
+                "without building, pushing, logging in, or mutating a registry tag."
             )
             return 0
         raise ValidationError("unknown command")

@@ -1,0 +1,126 @@
+name: Docker image verification
+
+on:
+    workflow_dispatch:
+        inputs:
+            release_tag:
+                description: Existing annotated stable release tag, for example v0.2.3
+                required: true
+                type: string
+            expected_digest:
+                description: Optional expected immutable image index digest (sha256:...)
+                required: false
+                default: ""
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    verify:
+        name: Verify an existing immutable image
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        concurrency:
+            group: docker-verify-${{ inputs.release_tag }}
+            cancel-in-progress: false
+        steps:
+            - name: Resolve the protected default-branch commit without credentials
+              id: default-branch
+              shell: bash
+              env:
+                  GIT_TERMINAL_PROMPT: "0"
+                  GIT_CONFIG_NOSYSTEM: "1"
+                  GIT_CONFIG_GLOBAL: /dev/null
+              run: |
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import os
+                  import re
+                  import subprocess
+
+                  url = "https://github.com/shareur/TGHarbor.git"
+                  result = subprocess.run(
+                      ["git", "ls-remote", "--exit-code", url, "refs/heads/master"],
+                      capture_output=True,
+                      text=True,
+                      check=False,
+                  )
+                  if result.returncode != 0:
+                      raise SystemExit("could not resolve the protected default branch")
+                  lines = result.stdout.splitlines()
+                  fields = lines[0].split() if len(lines) == 1 else []
+                  if len(fields) != 2 or fields[1] != "refs/heads/master":
+                      raise SystemExit("the protected default branch resolved ambiguously")
+                  sha = fields[0]
+                  if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+                      raise SystemExit("the protected default branch did not resolve to a full commit SHA")
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as handle:
+                      handle.write(f"default_branch_sha={sha}\n")
+                  PY
+            - name: Check out verifier source from the exact default-branch commit
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  ref: ${{ steps.default-branch.outputs.default_branch_sha }}
+                  path: workflow-source
+                  fetch-depth: 1
+                  persist-credentials: false
+            - name: Resolve and validate the published annotated tag
+              id: resolve
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ inputs.release_tag }}
+              run: |
+                  set -euo pipefail
+                  python workflow-source/.github/scripts/validate_docker_release.py resolve-existing \
+                    --release-tag "$RELEASE_TAG" \
+                    --output "$GITHUB_OUTPUT"
+            - name: Check out the exact tagged commit
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  ref: ${{ steps.resolve.outputs.release_sha }}
+                  path: release
+                  fetch-depth: 1
+                  persist-credentials: false
+            - name: Set up QEMU for linux/arm64 runtime smoke
+              uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+            - name: Discover the immutable digest and verify the existing image identity
+              id: existing
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+                  RELEASE_SHA: ${{ steps.resolve.outputs.release_sha }}
+                  EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+              run: |
+                  set -euo pipefail
+                  arguments=(
+                    --checkout release
+                    --release-tag "$RELEASE_TAG"
+                    --release-sha "$RELEASE_SHA"
+                    --output "$GITHUB_OUTPUT"
+                  )
+                  if [ -n "$EXPECTED_DIGEST" ]; then
+                    arguments+=(--expected-digest "$EXPECTED_DIGEST")
+                  fi
+                  python workflow-source/.github/scripts/validate_docker_release.py \
+                    verify-existing "${arguments[@]}"
+            - name: Run existing-image labels, provenance, SBOM, layer, and runtime checks
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ steps.existing.outputs.release_tag }}
+                  RELEASE_VERSION: ${{ steps.existing.outputs.release_version }}
+                  RELEASE_SHA: ${{ steps.existing.outputs.release_sha }}
+                  IMAGE_CREATED: ${{ steps.existing.outputs.image_created }}
+                  IMAGE_SOURCE: ${{ steps.existing.outputs.image_source }}
+                  IMAGE_DIGEST: ${{ steps.existing.outputs.image_digest }}
+              run: |
+                  set -euo pipefail
+                  python workflow-source/.github/scripts/verify_docker_release.py \
+                    --release-tag "$RELEASE_TAG" \
+                    --release-version "$RELEASE_VERSION" \
+                    --release-sha "$RELEASE_SHA" \
+                    --image-created "$IMAGE_CREATED" \
+                    --image-source "$IMAGE_SOURCE" \
+                    --expected-digest "$IMAGE_DIGEST" \
+                    --output "$GITHUB_OUTPUT" \
+                    --summary "$GITHUB_STEP_SUMMARY"

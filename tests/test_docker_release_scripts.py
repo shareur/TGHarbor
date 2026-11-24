@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tarfile
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github" / "scripts"
@@ -32,6 +34,10 @@ CANDIDATE_SHA_TAG = "sha-2b9ed1f70860"
 LIVE_DIGEST = "sha256:b40996ef4938f8545e5eaee86c91fc57b3d27f9b087353d02a97ae7548c5f560"
 LIVE_REVISION = "13c5bc7645b9ba27ea9837be3697fa1388ffb44d"
 LIVE_SHA_TAG = f"sha-{LIVE_REVISION[:12]}"
+PUBLISHED_V023_SHA = "48e89349981f29808d3280eaf6a4bba09d8864fd"
+PUBLISHED_V023_TAG_OBJECT = "18786ef014337030d389569acb8e7086c99b3a06"
+PUBLISHED_V023_DIGEST = "sha256:b8aa804699a79fbebce5e9b5ff23ead0dbfaa2acb9aa380a119d91b171c55a24"
+VERIFY_WORKFLOW = ROOT / ".github" / "workflows" / "docker-verify.yml"
 
 
 def _load_script(name: str):
@@ -1360,21 +1366,47 @@ def test_pre_push_command_applies_forward_only_alias_policy(tmp_path: Path) -> N
         )
 
 
-def _provenance_statement(subject: str = PLATFORM_DIGESTS["amd64"]) -> dict[str, Any]:
+def _provenance_statement(
+    subject: str = PLATFORM_DIGESTS["amd64"],
+    *,
+    sha: str = SHA,
+    source_uri: str = "https://github.com/shareur/TGHarbor.git",
+    ref: str | None = None,
+    include_dependencies: bool = True,
+) -> dict[str, Any]:
+    """Build the BuildKit SLSA v1 shape observed from the published image."""
+
+    config_source: dict[str, Any] = {"uri": source_uri, "digest": {"sha1": sha}}
+    if ref is not None:
+        config_source["ref"] = ref
+    build_definition: dict[str, Any] = {
+        "buildType": "https://mobyproject.org/buildkit@v1",
+        "externalParameters": {
+            "configSource": config_source,
+            "request": {
+                "frontend": "dockerfile.v0",
+                "args": {"build-arg:TGHARBOR_IMAGE_REVISION": sha},
+            },
+        },
+    }
+    if include_dependencies:
+        # Real BuildKit publishes the resolved Git dependency with the commit
+        # under ``digest.gitCommit`` only; ``digest.sha1`` is not repeated.
+        build_definition["resolvedDependencies"] = [
+            {
+                "uri": f"git+{source_uri}",
+                "digest": {"gitCommit": sha},
+            },
+            {
+                "uri": "pkg:docker/python@sha256:" + "0" * 64,
+                "digest": {"sha256": "0" * 64},
+            },
+        ]
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{"name": "pkg:docker/shareur/tgharbor", "digest": {"sha256": subject}}],
         "predicateType": "https://slsa.dev/provenance/v1",
-        "predicate": {
-            "buildDefinition": {
-                "externalParameters": {
-                    "source": {
-                        "uri": "https://github.com/shareur/TGHarbor.git",
-                        "digest": {"sha1": SHA},
-                    }
-                }
-            }
-        },
+        "predicate": {"buildDefinition": build_definition},
     }
 
 
@@ -1450,7 +1482,7 @@ def release_graph(
         subject = statement_subject_override or PLATFORM_DIGESTS[architecture]
         layers: list[dict[str, Any]] = []
         if include_provenance:
-            provenance = _provenance_statement(subject)
+            provenance = _provenance_statement(subject, sha=metadata.sha, ref=metadata.tag)
             blobs[PROVENANCE_BLOBS[architecture]] = json.dumps(provenance).encode("utf-8")
             layers.append(
                 {
@@ -1661,6 +1693,60 @@ def test_registry_release_rejects_forbidden_payload_history() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        (
+            "/bin/sh -c #(nop)  ENV PYTHONDONTWRITEBYTECODE=1 "
+            "PYTHONUNBUFFERED=1 TGHARBOR_CONFIG=/config/config.yaml"
+        ),
+        "ENV TGHARBOR_DATA_DIR=/data TGHARBOR_DOWNLOADS_DIR=/downloads",
+        "ARG TGHARBOR_IMAGE_SOURCE=https://github.com/shareur/TGHarbor",
+        f"ARG TGHARBOR_IMAGE_REVISION={PUBLISHED_V023_SHA}",
+        "COPY pyproject.toml README.md ./",
+        "RUN pip install --no-cache-dir .",
+        "RUN mkdir -p /config /data /downloads",
+    ],
+)
+def test_history_scan_allows_runtime_paths_and_safe_build_commands(entry: str) -> None:
+    assert verify.assert_history_has_no_project_payload([{"created_by": entry}]) is None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "COPY .env /app/.env",
+        "COPY config.yaml /app/config.yaml",
+        "ADD compose.yaml /app/",
+        "RUN cp .env /app/.env",
+        "COPY tests/unit.py /app/tests/unit.py",
+        "COPY .git/config /app/.git/config",
+        "RUN echo state > /app/state.session",
+        "RUN touch /app/library.sqlite3",
+        "RUN echo log > /app/service.log",
+        "ENV TELEGRAM_API_HASH=redacted-api-hash-fixture",
+        "ENV TELEGRAM_BOT_TOKEN=123456789:AAHabcdefghijklmnopqrstuvwxyz012345",
+        "ARG TELEGRAM_PHONE=+15551234567",
+        "ENV SESSION_PATH=/sessions/name.session",
+        "ENV TGHARBOR_CONFIG=config.yaml",
+        "ENV TGHARBOR_CONFIG=/config/.env",
+        "ENV TGHARBOR_CONFIG=/config/state.session",
+        "COPY /config/config.yaml /app/config.yaml",
+    ],
+)
+def test_history_scan_rejects_actual_payload_paths_and_sensitive_values(entry: str) -> None:
+    with pytest.raises(verify.VerificationError):
+        verify.assert_history_has_no_project_payload([{"created_by": entry}])
+
+
+def test_history_scan_applies_to_comment_and_author_fields() -> None:
+    for key in ("comment", "author"):
+        with pytest.raises(verify.VerificationError):
+            verify.assert_history_has_no_project_payload(
+                [{key: "COPY config.yaml /app/config.yaml"}]
+            )
+
+
 def test_registry_release_retries_eventual_consistency_and_fails_on_ambiguity() -> None:
     metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
     registry = FakeRegistry(release_graph(metadata))
@@ -1707,41 +1793,154 @@ def test_statement_binding_helpers_require_exact_subject_source_and_revision() -
     metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
     assert verify.provenance_binds_source_and_revision(statement, metadata)
     wrong_source = copy.deepcopy(statement)
-    wrong_source["predicate"]["buildDefinition"]["externalParameters"]["source"]["uri"] = (
+    wrong_source["predicate"]["buildDefinition"]["externalParameters"]["configSource"]["uri"] = (
         "https://evil.example/TGHarbor.git"
     )
     assert not verify.provenance_binds_source_and_revision(wrong_source, metadata)
     wrong_revision = copy.deepcopy(statement)
-    wrong_revision["predicate"]["buildDefinition"]["externalParameters"]["source"]["digest"][
+    wrong_revision["predicate"]["buildDefinition"]["externalParameters"]["configSource"]["digest"][
         "sha1"
     ] = OTHER_SHA
     assert not verify.provenance_binds_source_and_revision(wrong_revision, metadata)
 
 
-def test_provenance_accepts_only_typed_buildkit_source_paths() -> None:
+def test_provenance_accepts_real_buildkit_shape_and_validated_legacy_shapes() -> None:
     metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
     statement = _provenance_statement()
     assert verify.provenance_binds_source_and_revision(statement, metadata)
+    assert verify.provenance_binds_source_and_revision(
+        _provenance_statement(ref=metadata.tag), metadata
+    )
+    assert verify.provenance_binds_source_and_revision(
+        _provenance_statement(ref=metadata.sha), metadata
+    )
 
-    alternate = copy.deepcopy(statement)
-    external = alternate["predicate"]["buildDefinition"]["externalParameters"]
-    source = external.pop("source")
-    external["config"] = {"source": source}
-    assert verify.provenance_binds_source_and_revision(alternate, metadata)
+    legacy_direct = copy.deepcopy(statement)
+    build_definition = legacy_direct["predicate"]["buildDefinition"]
+    external = build_definition["externalParameters"]
+    source = external.pop("configSource")
+    external["source"] = source
+    build_definition.pop("resolvedDependencies")
+    assert verify.provenance_binds_source_and_revision(legacy_direct, metadata)
 
-    both = copy.deepcopy(alternate)
-    both["predicate"]["buildDefinition"]["externalParameters"]["source"] = {
-        "uri": contract.CANONICAL_SOURCE_URL,
-        "digest": {"sha1": SHA},
+    legacy_config = copy.deepcopy(legacy_direct)
+    legacy_external = legacy_config["predicate"]["buildDefinition"]["externalParameters"]
+    legacy_external["config"] = {"source": legacy_external.pop("source")}
+    assert verify.provenance_binds_source_and_revision(legacy_config, metadata)
+
+    for ambiguous in (
+        {
+            **copy.deepcopy(external),
+            "configSource": copy.deepcopy(source),
+            "source": copy.deepcopy(source),
+        },
+        {
+            **copy.deepcopy(external),
+            "configSource": copy.deepcopy(source),
+            "config": {"source": copy.deepcopy(source)},
+        },
+    ):
+        candidate = copy.deepcopy(statement)
+        candidate["predicate"]["buildDefinition"]["externalParameters"] = ambiguous
+        assert not verify.provenance_binds_source_and_revision(candidate, metadata)
+
+    assert not verify.provenance_binds_source_and_revision(
+        _provenance_statement(ref="v0.2.1"), metadata
+    )
+    assert not verify.provenance_binds_source_and_revision(
+        _provenance_statement(sha=OTHER_SHA), metadata
+    )
+
+
+def _canonical_resolved_dependency(digest_value: Any) -> dict[str, Any]:
+    return {"uri": "git+https://github.com/shareur/TGHarbor.git", "digest": digest_value}
+
+
+def _provenance_with_dependencies(
+    dependencies: list[dict[str, Any]],
+) -> dict[str, Any]:
+    statement = _provenance_statement()
+    statement["predicate"]["buildDefinition"]["resolvedDependencies"] = dependencies
+    return statement
+
+
+def test_provenance_dependency_binding_prefers_git_commit_and_accepts_compat_alias() -> None:
+    metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
+
+    published = _provenance_statement()
+    published_dependency = published["predicate"]["buildDefinition"]["resolvedDependencies"][0]
+    # The real published shape carries only ``gitCommit`` on the Git dependency.
+    assert published_dependency["digest"] == {"gitCommit": SHA}
+    assert verify.provenance_binds_source_and_revision(published, metadata)
+
+    for digest_value in (
+        {"gitCommit": SHA},
+        {"sha1": SHA},
+        {"gitCommit": SHA, "sha1": SHA},
+    ):
+        statement = _provenance_with_dependencies(
+            [
+                _canonical_resolved_dependency(digest_value),
+                {
+                    "uri": "pkg:docker/python@sha256:" + "0" * 64,
+                    "digest": {"sha256": "0" * 64},
+                },
+            ]
+        )
+        assert verify.provenance_binds_source_and_revision(statement, metadata), digest_value
+
+
+def test_provenance_rejects_divergent_or_missing_dependency_digests() -> None:
+    metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
+    rejected = (
+        {"gitCommit": OTHER_SHA},
+        {"gitCommit": SHA, "sha1": OTHER_SHA},
+        {"gitCommit": OTHER_SHA, "sha1": SHA},
+        {"sha1": OTHER_SHA},
+        {},
+        {"gitCommit": 123},
+        {"gitCommit": SHA, "sha1": 123},
+        "not-a-mapping",
+    )
+    for digest_value in rejected:
+        statement = _provenance_with_dependencies([_canonical_resolved_dependency(digest_value)])
+        assert not verify.provenance_binds_source_and_revision(statement, metadata), digest_value
+
+
+def test_provenance_rejects_duplicate_and_conflicting_git_dependencies() -> None:
+    metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
+    cases = {
+        "duplicate matching": [
+            _canonical_resolved_dependency({"gitCommit": SHA}),
+            _canonical_resolved_dependency({"gitCommit": SHA}),
+        ],
+        "duplicate mixed alias": [
+            _canonical_resolved_dependency({"gitCommit": SHA}),
+            _canonical_resolved_dependency({"sha1": SHA}),
+        ],
+        "duplicate conflicting": [
+            _canonical_resolved_dependency({"gitCommit": SHA}),
+            _canonical_resolved_dependency({"gitCommit": OTHER_SHA}),
+        ],
+        "duplicate fragment form": [
+            _canonical_resolved_dependency({"gitCommit": SHA}),
+            {
+                "uri": "git+https://github.com/shareur/TGHarbor#refs/heads/master",
+                "digest": {"gitCommit": SHA},
+            },
+        ],
     }
-    assert not verify.provenance_binds_source_and_revision(both, metadata)
+    for label, dependencies in cases.items():
+        statement = _provenance_with_dependencies(dependencies)
+        assert not verify.provenance_binds_source_and_revision(statement, metadata), label
 
 
 def test_provenance_rejects_build_argument_only_source_and_revision_strings() -> None:
     metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
     statement = _provenance_statement()
-    external = statement["predicate"]["buildDefinition"]["externalParameters"]
-    del external["source"]
+    build_definition = statement["predicate"]["buildDefinition"]
+    external = build_definition["externalParameters"]
+    del external["configSource"]
     external["config"] = {
         "buildArgs": {
             "TGHARBOR_IMAGE_SOURCE": contract.CANONICAL_SOURCE_URL,
@@ -1758,11 +1957,15 @@ def test_provenance_rejects_build_argument_only_source_and_revision_strings() ->
     }
     assert not verify.provenance_binds_source_and_revision(statement, metadata)
 
+    dependencies_only = _provenance_statement()
+    del dependencies_only["predicate"]["buildDefinition"]["externalParameters"]["configSource"]
+    assert not verify.provenance_binds_source_and_revision(dependencies_only, metadata)
+
 
 def test_provenance_rejects_malformed_structural_bindings() -> None:
     metadata = contract.derive_release_metadata(TAG, SHA, EPOCH)
     cases: list[dict[str, Any]] = []
-    for mutate in (
+    mutators = (
         lambda statement: statement.update({"predicateType": "https://example.test/provenance"}),
         lambda statement: statement.update({"predicate": []}),
         lambda statement: statement["predicate"].update({"buildDefinition": []}),
@@ -1770,28 +1973,383 @@ def test_provenance_rejects_malformed_structural_bindings() -> None:
             {"externalParameters": []}
         ),
         lambda statement: statement["predicate"]["buildDefinition"]["externalParameters"][
-            "source"
+            "configSource"
         ].update({"uri": 123}),
         lambda statement: statement["predicate"]["buildDefinition"]["externalParameters"][
-            "source"
+            "configSource"
+        ].update({"uri": "https://evil.example/TGHarbor.git"}),
+        lambda statement: statement["predicate"]["buildDefinition"]["externalParameters"][
+            "configSource"
         ].update({"digest": {"sha1": 123}}),
         lambda statement: statement["predicate"]["buildDefinition"]["externalParameters"][
-            "source"
+            "configSource"
         ].update({"digest": "sha1"}),
         lambda statement: statement["predicate"]["buildDefinition"]["externalParameters"].update(
-            {"source": []}
+            {"configSource": []}
         ),
-    ):
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {"resolvedDependencies": []}
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {"resolvedDependencies": "not-a-list"}
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {"resolvedDependencies": [123]}
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {
+                "resolvedDependencies": [
+                    {
+                        "uri": "https://github.com/shareur/TGHarbor.git",
+                        "digest": {"sha1": OTHER_SHA},
+                    }
+                ]
+            }
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {
+                "resolvedDependencies": [
+                    {
+                        "uri": "https://github.com/shareur/TGHarbor.git",
+                        "digest": {"sha1": SHA},
+                    },
+                    {
+                        "uri": "git+https://github.com/shareur/TGHarbor.git",
+                        "digest": {"sha1": SHA, "gitCommit": SHA},
+                    },
+                ]
+            }
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {
+                "resolvedDependencies": [
+                    {
+                        "uri": "https://github.com/shareur/TGHarbor.git",
+                        "digest": {"sha1": SHA, "gitCommit": OTHER_SHA},
+                    }
+                ]
+            }
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {
+                "resolvedDependencies": [
+                    {
+                        "uri": "https://github.com/shareur/TGHarbor.git",
+                        "digest": {"sha1": SHA},
+                    },
+                    {
+                        "uri": "https://github.com/shareur/TGHarbor.git",
+                        "digest": {"sha1": SHA},
+                    },
+                ]
+            }
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"].update(
+            {
+                "resolvedDependencies": [
+                    {"uri": "https://evil.example/TGHarbor.git", "digest": {"sha1": SHA}}
+                ]
+            }
+        ),
+        lambda statement: statement["predicate"]["buildDefinition"]["externalParameters"].update(
+            {
+                "configSource": {
+                    "uri": "https://github.com/shareur/TGHarbor.git",
+                    "digest": {"sha1": SHA},
+                    "ref": "refs/heads/dev",
+                }
+            }
+        ),
+    )
+    for mutate in mutators:
         statement = copy.deepcopy(_provenance_statement())
         mutate(statement)
         cases.append(statement)
-    alternate = copy.deepcopy(_provenance_statement())
-    alternate_external = alternate["predicate"]["buildDefinition"]["externalParameters"]
-    alternate_external["config"] = {"source": alternate_external.pop("source")}
-    alternate_external["config"]["source"].update({"uri": 123})
-    cases.append(alternate)
+    legacy_malformed = copy.deepcopy(_provenance_statement())
+    legacy_build = legacy_malformed["predicate"]["buildDefinition"]
+    legacy_external = legacy_build["externalParameters"]
+    legacy_source = legacy_external.pop("configSource")
+    legacy_external["source"] = legacy_source
+    legacy_build.pop("resolvedDependencies")
+    legacy_external["source"]["uri"] = 123
+    cases.append(legacy_malformed)
     for statement in cases:
         assert not verify.provenance_binds_source_and_revision(statement, metadata)
+
+
+def reachability_mapping_for(
+    commit: str, default_branch: str = DEFAULT_BRANCH_SHA
+) -> dict[str, Any]:
+    return {
+        f"/repos/{REPOSITORY}/branches/master": {"commit": {"sha": default_branch}},
+        f"/repos/{REPOSITORY}/compare/{commit}...{default_branch}": {
+            "status": "ahead",
+            "behind_by": 0,
+            "ahead_by": 1,
+            "merge_base_commit": {"sha": commit},
+        },
+    }
+
+
+def existing_release_graph(metadata: contract.ReleaseMetadata, digest_value: str) -> dict[str, Any]:
+    index = {
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "schemaVersion": 2,
+        "manifests": [],
+    }
+    body = json.dumps(index).encode("utf-8")
+    return {
+        "manifests": {digest_value: body},
+        "blobs": {},
+        "tags": {tag: digest_value for tag in metadata.image_tags},
+    }
+
+
+def published_v023_metadata() -> contract.ReleaseMetadata:
+    return contract.derive_release_metadata("v0.2.3", PUBLISHED_V023_SHA, EPOCH)
+
+
+def test_v023_regression_fixture_binds_published_revision_digest_and_runtime_paths() -> None:
+    metadata = published_v023_metadata()
+    assert metadata.sha_tag == "sha-48e89349981f"
+    assert verify.provenance_binds_source_and_revision(
+        _provenance_statement(sha=PUBLISHED_V023_SHA, ref=metadata.tag), metadata
+    )
+    assert (
+        verify.assert_history_has_no_project_payload(
+            [
+                {
+                    "created_by": "/bin/sh -c #(nop)  ENV PYTHONDONTWRITEBYTECODE=1 "
+                    "PYTHONUNBUFFERED=1 TGHARBOR_CONFIG=/config/config.yaml"
+                }
+            ]
+        )
+        is None
+    )
+    layer = layer_archive(directory_member("."), regular_member("app/main.py"))
+    assert (
+        verify.inspect_layer_archive(
+            layer_blob_digest(layer), verify.OCI_GZIP_LAYER_MEDIA_TYPE, layer
+        )
+        is None
+    )
+    registry = FakeRegistry(existing_release_graph(metadata, PUBLISHED_V023_DIGEST))
+    assert validate._discover_existing_digest(registry, metadata) == PUBLISHED_V023_DIGEST
+
+
+def test_existing_digest_discovery_fails_closed_on_divergence_or_absent_identity() -> None:
+    metadata = published_v023_metadata()
+    divergent = existing_release_graph(metadata, PUBLISHED_V023_DIGEST)
+    divergent["manifests"][digest("f")] = divergent["manifests"][PUBLISHED_V023_DIGEST]
+    divergent["tags"]["latest"] = digest("f")
+    with pytest.raises(validate.ValidationError, match="diverges"):
+        validate._discover_existing_digest(FakeRegistry(divergent), metadata)
+
+    mismatched_sha = existing_release_graph(metadata, PUBLISHED_V023_DIGEST)
+    mismatched_sha["tags"][metadata.sha_tag] = digest("f")
+    mismatched_sha["manifests"][digest("f")] = mismatched_sha["manifests"][PUBLISHED_V023_DIGEST]
+    with pytest.raises(validate.ValidationError, match="same image digest"):
+        validate._discover_existing_digest(FakeRegistry(mismatched_sha), metadata)
+
+    missing_immutable = existing_release_graph(metadata, PUBLISHED_V023_DIGEST)
+    del missing_immutable["tags"][metadata.version]
+    with pytest.raises(validate.ValidationError, match="does not exist"):
+        validate._discover_existing_digest(FakeRegistry(missing_immutable), metadata)
+
+    missing_alias = existing_release_graph(metadata, PUBLISHED_V023_DIGEST)
+    del missing_alias["tags"]["latest"]
+    with pytest.raises(validate.ValidationError, match="does not exist"):
+        validate._discover_existing_digest(FakeRegistry(missing_alias), metadata)
+
+
+def test_resolve_existing_command_outputs_exact_tag_commit_and_default_branch(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    remote = validate._resolve_existing_command(
+        release_tag=TAG,
+        output_path=output,
+        api=FakeGitHub({**remote_mapping(), **reachability_mapping()}),
+    )
+    assert remote.commit_sha == SHA
+    rendered = output.read_text(encoding="utf-8")
+    assert f"release_sha={SHA}" in rendered
+    assert f"default_branch_sha={DEFAULT_BRANCH_SHA}" in rendered
+    assert "release_tag=v0.2.0" in rendered
+    assert "sha_tag=sha-8f4d8563e0d3" in rendered
+
+
+def test_verify_existing_command_verifies_without_publication(tmp_path: Path) -> None:
+    repo = tmp_path / "release"
+    repo.mkdir()
+    sha = _make_release_repo(repo)
+    metadata = validate.verify_release_checkout(repo, expected_tag=TAG, expected_sha=sha)
+    graph = release_graph(metadata)
+    output = tmp_path / "output"
+    verified, result = validate._verify_existing_command(
+        release_tag=TAG,
+        release_sha=sha,
+        checkout=repo,
+        expected_digest=INDEX_DIGEST,
+        output_path=output,
+        api=FakeGitHub({**remote_mapping(commit=sha), **reachability_mapping_for(sha)}),
+        registry=FakeRegistry(graph),
+        retry_attempts=1,
+        retry_delay=0,
+        sleep=lambda _: None,
+    )
+    assert verified == metadata
+    assert result.digest == INDEX_DIGEST
+    rendered = output.read_text(encoding="utf-8")
+    assert f"image_digest={INDEX_DIGEST}" in rendered
+    assert f"release_sha={sha}" in rendered
+    assert f"image_created={metadata.created}" in rendered
+
+
+def test_verify_existing_command_fails_closed_on_identity_or_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "release"
+    repo.mkdir()
+    sha = _make_release_repo(repo)
+    metadata = validate.verify_release_checkout(repo, expected_tag=TAG, expected_sha=sha)
+    api = FakeGitHub({**remote_mapping(commit=sha), **reachability_mapping_for(sha)})
+    with pytest.raises(validate.ValidationError, match="does not match the expected digest"):
+        validate._verify_existing_command(
+            release_tag=TAG,
+            release_sha=sha,
+            checkout=repo,
+            expected_digest=digest("f"),
+            output_path=tmp_path / "output",
+            api=api,
+            registry=FakeRegistry(release_graph(metadata)),
+            retry_attempts=1,
+            retry_delay=0,
+            sleep=lambda _: None,
+        )
+    with pytest.raises(validate.ValidationError, match="peeled tag SHA changed"):
+        validate._verify_existing_command(
+            release_tag=TAG,
+            release_sha=sha,
+            checkout=repo,
+            expected_digest=None,
+            output_path=tmp_path / "output",
+            api=FakeGitHub(
+                {**remote_mapping(commit=OTHER_SHA), **reachability_mapping_for(OTHER_SHA)}
+            ),
+            registry=FakeRegistry(release_graph(metadata)),
+            retry_attempts=1,
+            retry_delay=0,
+            sleep=lambda _: None,
+        )
+
+    wrong_version = tmp_path / "wrong-version"
+    wrong_version.mkdir()
+    wrong_sha = _make_release_repo(
+        wrong_version, pyproject_version="0.1.9", runtime_version="0.1.9"
+    )
+    with pytest.raises(validate.ValidationError, match="version differ"):
+        validate._verify_existing_command(
+            release_tag=TAG,
+            release_sha=wrong_sha,
+            checkout=wrong_version,
+            expected_digest=None,
+            output_path=tmp_path / "output",
+            api=FakeGitHub(
+                {
+                    **remote_mapping(commit=wrong_sha),
+                    **reachability_mapping_for(wrong_sha),
+                }
+            ),
+            registry=FakeRegistry(release_graph(metadata)),
+            retry_attempts=1,
+            retry_delay=0,
+            sleep=lambda _: None,
+        )
+
+
+def test_existing_modes_use_a_credential_free_github_api() -> None:
+    api = validate._anonymous_api_from_environment({"GITHUB_TOKEN": "not-used"})
+    assert api._token is None
+
+
+def test_verify_existing_cli_accepts_the_v023_published_identity(tmp_path: Path) -> None:
+    parser = validate._build_parser({})
+    arguments = parser.parse_args(
+        [
+            "verify-existing",
+            "--checkout",
+            str(tmp_path),
+            "--release-tag",
+            "v0.2.3",
+            "--release-sha",
+            PUBLISHED_V023_SHA,
+            "--expected-digest",
+            PUBLISHED_V023_DIGEST,
+            "--output",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert arguments.command == "verify-existing"
+    assert arguments.expected_digest == PUBLISHED_V023_DIGEST
+
+
+def test_verification_workflow_is_manual_read_only_and_never_publishes() -> None:
+    text = VERIFY_WORKFLOW.read_text(encoding="utf-8")
+    document = yaml.safe_load(text)
+    trigger = document[True]
+    assert set(trigger) == {"workflow_dispatch"}
+    inputs = trigger["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"release_tag", "expected_digest"}
+    assert inputs["release_tag"]["required"] is True
+    assert inputs["expected_digest"]["required"] is False
+    assert document["permissions"] == {"contents": "read"}
+
+    job = document["jobs"]["verify"]
+    assert "environment" not in job
+    assert job["concurrency"]["cancel-in-progress"] is False
+    assert job["timeout-minutes"] == 30
+    for forbidden in (
+        "secrets.",
+        "docker/login-action",
+        "build-push-action",
+        "upload-artifact",
+        "push: true",
+        "docker push",
+        "docker build",
+        "docker tag",
+        "docker rmi",
+        "docker login",
+        "delete",
+    ):
+        assert forbidden not in text
+    for step in job["steps"]:
+        if "uses" in step:
+            assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", step["uses"])
+        env = step.get("env") or {}
+        assert "GITHUB_TOKEN" not in env
+        assert all("secrets." not in str(value) for value in env.values())
+    assert '"git", "ls-remote"' in text
+    assert "refs/heads/master" in text
+    assert "resolved ambiguously" in text
+    assert "GIT_CONFIG_GLOBAL" in text
+    assert "DOCKERHUB" not in text
+    assert "${{ steps.default-branch.outputs.default_branch_sha }}" in text
+    assert "persist-credentials: false" in text
+    assert "resolve-existing" in text
+    assert "verify-existing" in text
+    assert "verify_docker_release.py" in text
+    assert "GITHUB_OUTPUT" in text
+
+
+def test_v023_regression_workflow_pins_expected_digest_input() -> None:
+    text = VERIFY_WORKFLOW.read_text(encoding="utf-8")
+    assert "expected_digest" in text
+    assert "EXPECTED_DIGEST" in text
+    assert "--expected-digest" in text
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", PUBLISHED_V023_DIGEST)
+    assert re.fullmatch(r"[0-9a-f]{40}", PUBLISHED_V023_SHA)
+    assert re.fullmatch(r"[0-9a-f]{40}", PUBLISHED_V023_TAG_OBJECT)
 
 
 def test_default_smoke_script_has_no_project_restricted_names() -> None:
@@ -1909,6 +2467,7 @@ RESTRICTED_LAYER_MEMBERS = (
     "app/restricted-tree/neutral.txt",
     "app/governance-note.md",
     "app/nested/governance-note.md",
+    "./app/restricted-tree/neutral.txt",
 )
 EXISTING_FORBIDDEN_LAYER_MEMBERS = (
     "app/.env",
@@ -1919,12 +2478,14 @@ EXISTING_FORBIDDEN_LAYER_MEMBERS = (
     "app/session.session",
     "app/cache.sqlite3",
     "app/service.log",
+    "./app/.env",
 )
 
 
 @pytest.mark.parametrize("media_type", sorted(verify.SUPPORTED_LAYER_MEDIA_TYPES))
 def test_layer_scan_accepts_clean_compressed_and_uncompressed_layers(media_type: str) -> None:
     data = layer_archive(
+        directory_member("."),
         directory_member("app"),
         regular_member("app/main.py"),
         symlink_member("app/link", "main.py"),
@@ -1932,6 +2493,92 @@ def test_layer_scan_accepts_clean_compressed_and_uncompressed_layers(media_type:
         compress=media_type in verify.GZIP_LAYER_MEDIA_TYPES,
     )
     assert verify.inspect_layer_archive(layer_blob_digest(data), media_type, data) is None
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        regular_member("."),
+        symlink_member(".", "app"),
+        hardlink_member(".", "app/main.py"),
+        special_member(".", tarfile.FIFOTYPE),
+        special_member(".", tarfile.CHRTYPE),
+    ],
+)
+def test_layer_scan_rejects_non_directory_root_marker(
+    member: tuple[tarfile.TarInfo, bytes | None],
+) -> None:
+    data = layer_archive(member)
+    layer_digest = layer_blob_digest(data)
+    with pytest.raises(verify.VerificationError) as caught:
+        verify.inspect_layer_archive(layer_digest, verify.OCI_GZIP_LAYER_MEDIA_TYPE, data)
+    assert layer_digest in str(caught.value)
+    assert "root marker" in str(caught.value)
+
+
+def test_layer_scan_rejects_root_marker_with_device_or_link_metadata() -> None:
+    layer_digest = digest("f")
+    device_directory = tarfile.TarInfo(".")
+    device_directory.type = tarfile.DIRTYPE
+    device_directory.devmajor = 1
+    linked_directory = tarfile.TarInfo(".")
+    linked_directory.type = tarfile.DIRTYPE
+    linked_directory.linkname = "app"
+    for member in (device_directory, linked_directory):
+        with pytest.raises(verify.VerificationError):
+            verify._inspect_layer_member(layer_digest, member)
+
+
+def test_layer_scan_accepts_dot_slash_serialized_root_after_tarfile_normalization() -> None:
+    # ``tarfile`` writes a directory header with a trailing slash and strips it
+    # when parsing, so a serialized ``./`` directory is returned as the published
+    # canonical root marker ``.``. It is therefore not a distinct accepted form.
+    data = layer_archive(directory_member("./"))
+    assert (
+        verify.inspect_layer_archive(
+            layer_blob_digest(data), verify.OCI_GZIP_LAYER_MEDIA_TYPE, data
+        )
+        is None
+    )
+
+
+def test_layer_member_inspection_rejects_non_canonical_dot_slash_root_marker() -> None:
+    # This branch is unreachable through ``inspect_layer_archive`` because
+    # ``tarfile`` normalizes a serialized ``./`` directory to ``.``; exercise it
+    # directly so the fail-closed policy is covered.
+    marker = tarfile.TarInfo("./")
+    marker.type = tarfile.DIRTYPE
+    with pytest.raises(verify.VerificationError, match="non-canonical root"):
+        verify._inspect_layer_member(digest("f"), marker)
+
+
+def test_layer_scan_rejects_duplicate_root_markers() -> None:
+    data = layer_archive(directory_member("."), directory_member("."))
+    with pytest.raises(verify.VerificationError, match="duplicate canonical root"):
+        verify.inspect_layer_archive(
+            layer_blob_digest(data), verify.OCI_GZIP_LAYER_MEDIA_TYPE, data
+        )
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "./app/.env",
+        "./app/restricted-tree/neutral.txt",
+        "../app/main.py",
+        "./../escape",
+        "./.",
+    ],
+)
+def test_layer_scan_does_not_allow_dot_components_to_bypass_checks(member_name: str) -> None:
+    data = layer_archive(regular_member(member_name))
+    with pytest.raises(verify.VerificationError):
+        verify.inspect_layer_archive(
+            layer_blob_digest(data),
+            verify.OCI_GZIP_LAYER_MEDIA_TYPE,
+            data,
+            RESTRICTED_POLICY,
+        )
 
 
 @pytest.mark.parametrize("member_name", RESTRICTED_LAYER_MEMBERS + EXISTING_FORBIDDEN_LAYER_MEMBERS)

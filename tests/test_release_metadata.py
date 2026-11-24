@@ -158,3 +158,41 @@ def test_secret_scan_stays_least_privilege_and_receives_no_credentials() -> None
     assert "contents: write" not in text
     assert "security-events" not in text
     assert "id-token" not in text
+
+
+def test_verification_only_workflow_is_read_only_and_secretless() -> None:
+    path = ROOT / ".github/workflows/docker-verify.yml"
+    text = path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    job = workflow["jobs"]["verify"]
+
+    assert workflow["permissions"] == {"contents": "read"}
+    assert "environment" not in job
+    assert job["concurrency"]["cancel-in-progress"] is False
+    assert "secrets." not in text
+    for step in job["steps"]:
+        assert "GITHUB_TOKEN" not in (step.get("env") or {})
+    for forbidden in (
+        "docker/login-action",
+        "build-push-action",
+        "upload-artifact",
+        "docker push",
+        "docker build",
+        "docker tag",
+    ):
+        assert forbidden not in text
+
+
+def test_verification_only_workflow_pins_verifier_checkout_and_existing_mode() -> None:
+    text = (ROOT / ".github/workflows/docker-verify.yml").read_text(encoding="utf-8")
+
+    assert '"git", "ls-remote"' in text
+    assert "refs/heads/master" in text
+    assert "${{ steps.default-branch.outputs.default_branch_sha }}" in text
+    assert "persist-credentials: false" in text
+    assert "resolve-existing" in text
+    assert "verify-existing" in text
+    assert "verify_docker_release.py" in text
+    assert "--expected-digest" in text
+    assert "workflow_dispatch" in text
+    assert "workflow_run" not in text

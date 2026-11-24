@@ -132,6 +132,34 @@ runtime smoke result. A failed post-push check blocks the release and requires
 investigation or a new patch release; it never authorizes moving an immutable tag or
 a mutable alias backward.
 
+### Verification-only recovery for an already published image
+
+If publication pushed an immutable image but post-push verification failed, the
+registry may already hold the index digest and all four tags. Correct the verifier first,
+then verify that existing image without publishing again. Do not move, delete, or reuse
+an immutable tag, and do not re-run a workflow that would push a second image.
+
+The tracked `Docker image verification` workflow
+(`.github/workflows/docker-verify.yml`) is manually dispatchable for a stable tag. It has
+read-only repository permissions, no Docker Hub secrets or environment, and no registry
+login. It resolves the public annotated tag and peeled commit, proves reachability from
+the protected default branch, checks out the verifier source from that exact
+default-branch commit in a credential-free step, and checks out the exact tagged commit
+for version metadata. It then discovers the immutable index digest anonymously from the
+version tag and requires the derived minor, `latest`, and `sha-*` aliases to converge to
+the same digest. An optional expected digest input pins the exact existing identity and
+fails closed on a mismatch.
+
+After discovery, the workflow runs only existing-image verification: OCI labels,
+structural provenance, SBOM, layer and static checks, and the hardened Docker runtime
+smoke test. It never logs in, builds, pushes, retags, deletes, or mutates a registry or
+GitHub ref. Concurrency prevents duplicate verification but does not cancel a running
+check. A successful verification run establishes only that the already published image
+matches the corrected checks. It does not retroactively turn a failed publication into a
+successful release, replace a production restore-point backup, or authorize deployment.
+The `verify-existing` mode in the release contract provides the same discovery and
+verification path locally; it sends no credentials.
+
 Build the release image from the clean immutable candidate. The workflow build context
 is the already validated full commit SHA, not the mutable release tag ref; tag
 reachability and the exact CI run are still verified before the build. Set
@@ -154,11 +182,25 @@ docker build --pull \
 
 Inspect the resulting OCI labels and require title `TGHarbor`, version `0.2.3`, the
 exact candidate commit as revision, the verified public source, license `Apache-2.0`,
-and the supplied created timestamp. Post-push provenance must structurally bind the
-BuildKit source URI and its `sha1` commit to the canonical source and release revision;
-source or revision strings that appear only in build arguments, internal parameters, or
-other unrelated fields do not satisfy the check. Record the image digest with the label
-values, then run the final-filesystem, configuration/history, and per-layer scans.
+and the supplied created timestamp. The real BuildKit SLSA v1 shape carries the Git
+source under `predicate.buildDefinition.externalParameters.configSource` and repeats
+the source and revision binding in
+`predicate.buildDefinition.resolvedDependencies`. The verifier requires one canonical
+source URI, requires `configSource.digest.sha1` to equal the release revision, binds an
+optional `configSource.ref` to the release tag or commit, binds the resolved Git
+dependency primarily through `digest.gitCommit`, accepts `digest.sha1` only as a
+compatible alias when `gitCommit` is absent, requires both fields to agree when both are
+present, and rejects missing, conflicting, or
+multiple source entries, wrong URIs or revisions, malformed structures, mixed legacy and
+`configSource` paths, and source or revision strings that appear only in build arguments
+or internal parameters. Record the image digest with the label values, then run the
+final-filesystem, configuration/history, and per-layer scans. The history scan is
+path-aware: a runtime mount default such as `TGHARBOR_CONFIG=/config/config.yaml` is not
+a copied payload, while a copied `.env`, configuration file, test, Git, session,
+database, or log artifact remains forbidden. The layer scan accepts only the canonical
+tar root directory marker `.`, requires directory metadata, rejects unsafe link or
+device metadata, and applies normalization, forbidden-name, traversal, absolute,
+backslash, link-target, and duplicate checks to every other member.
 Rebuild the release image from the immutable candidate rather than relying on the
 mutable tag. An
 actual container build remains unpassed when Docker is unavailable; static Dockerfile
