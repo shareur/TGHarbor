@@ -3,8 +3,9 @@
 This script is intentionally credential-free with respect to Docker Hub. It
 accepts only a strict stable annotated tag on the project source repository,
 proves that its exact ``CI`` tag-push workflow run succeeded, binds the
-checked-out release source to the peeled tag commit, and refuses to continue
-when any target image tag already exists.
+checked-out release source to the peeled tag commit, rejects existing immutable
+target tags, and proves that each existing mutable alias is still bound to its
+verified OCI image identity before any credentialed registry login.
 """
 
 from __future__ import annotations
@@ -24,19 +25,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import verify_docker_release as image_registry
 from release_contract import (
     CANONICAL_DEFAULT_BRANCH,
     CANONICAL_REPOSITORY,
+    CANONICAL_SOURCE_URL,
     CI_WORKFLOW_NAME,
     CI_WORKFLOW_PATH,
     DOCKER_HUB_API_ROOT,
     GITHUB_API_ROOT,
     LATEST_TAG,
+    PUBLISHED_MINOR_TAG_PATTERN,
+    PUBLISHED_SHA_TAG_PATTERN,
+    PUBLISHED_VERSION_TAG_PATTERN,
     ContractError,
     ReleaseMetadata,
+    SemVer,
     derive_release_metadata,
+    parse_published_version_tag,
     parse_stable_tag,
     require_canonical_repository,
+    require_digest,
     require_full_sha,
     require_image_tag,
     write_github_outputs,
@@ -48,6 +57,11 @@ EVENT_WORKFLOW_DISPATCH = "workflow_dispatch"
 GITHUB_API_VERSION = "2022-11-28"
 MAX_API_RESPONSE_BYTES = 4_000_000
 MAX_EVENT_BYTES = 1_000_000
+MAX_TAG_API_RESPONSE_BYTES = 4_000_000
+TAG_PAGE_SIZE = 100
+MAX_TAG_PAGES = 100
+MAX_GITHUB_RUN_COUNTER = 2_147_483_647
+MAX_GITHUB_OBJECT_ID = 2**63 - 1
 
 
 # Contract violations and event validation failures share one public exception
@@ -62,10 +76,16 @@ class JsonApi(Protocol):
         ...
 
 
-class TagExistence(Protocol):
-    def tag_exists(self, tag: str) -> bool:
-        """Return whether a Docker Hub tag currently exists."""
+class RegistryTagCatalog(Protocol):
+    def list_tags(self) -> tuple[RegistryTag, ...]:
+        """Return the complete, paginated Docker Hub tag catalog."""
         ...
+
+
+@dataclass(frozen=True)
+class RegistryTag:
+    tag: str
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -95,9 +115,11 @@ def _require_text(value: object, *, label: str) -> str:
     return value
 
 
-def _require_positive_int(value: object, *, label: str) -> int:
+def _require_positive_int(value: object, *, label: str, max_value: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValidationError(f"{label} must be a positive integer")
+    if max_value is not None and value > max_value:
+        raise ValidationError(f"{label} exceeds the supported integer range")
     return value
 
 
@@ -321,6 +343,28 @@ def ci_run_matches(run: object, *, tag: str, sha: str) -> bool:
     return isinstance(head_name, str) and head_name.casefold() == CANONICAL_REPOSITORY.casefold()
 
 
+def _run_sort_key(run: Mapping[str, Any]) -> tuple[int, int, int]:
+    if not isinstance(run, Mapping):
+        raise ValidationError("CI run entry must be a JSON object")
+    return (
+        _require_positive_int(
+            run.get("run_attempt"),
+            label="CI run attempt",
+            max_value=MAX_GITHUB_RUN_COUNTER,
+        ),
+        _require_positive_int(
+            run.get("run_number"),
+            label="CI run number",
+            max_value=MAX_GITHUB_RUN_COUNTER,
+        ),
+        _require_positive_int(
+            run.get("id"),
+            label="CI run id",
+            max_value=MAX_GITHUB_OBJECT_ID,
+        ),
+    )
+
+
 def find_successful_tag_ci(api: JsonApi, *, tag: str, sha: str) -> Mapping[str, Any]:
     """Find the successful CI tag-push workflow run for an exact tag and SHA."""
 
@@ -350,15 +394,9 @@ def find_successful_tag_ci(api: JsonApi, *, tag: str, sha: str) -> Mapping[str, 
         raise ValidationError(
             "no successful CI push run exists for the exact release tag and commit"
         )
-    matches.sort(
-        key=lambda run: (
-            int(run.get("run_attempt", 0)),
-            int(run.get("run_number", 0)),
-            int(run.get("id", 0)),
-        )
-    )
+    matches.sort(key=_run_sort_key)
     selected = matches[-1]
-    _require_positive_int(selected.get("id"), label="CI run id")
+    _require_positive_int(selected.get("id"), label="CI run id", max_value=MAX_GITHUB_OBJECT_ID)
     return selected
 
 
@@ -480,7 +518,7 @@ def verify_release_checkout(
 
 
 class DockerHubTags:
-    """Read-only Docker Hub tag existence checks; sends no credentials."""
+    """Read-only Docker Hub tag existence and catalog checks; sends no credentials."""
 
     def __init__(
         self,
@@ -497,51 +535,275 @@ class DockerHubTags:
         self._timeout = timeout
         self._sleep = sleep
 
-    def tag_exists(self, tag: str) -> bool:
-        safe_tag = require_image_tag(tag)
+    def _get_json(self, url: str, *, allow_404: bool) -> Any | None:
         request = urllib.request.Request(
-            f"{self._base_url.rstrip('/')}/{urllib.parse.quote(safe_tag, safe='')}",
+            url,
             headers={
                 "Accept": "application/json",
                 "User-Agent": "TGHarbor-release-validation",
             },
             method="GET",
         )
+        last_status: int | None = None
         for attempt in range(1, self._attempts + 1):
             try:
                 with self._opener(request, timeout=self._timeout) as response:
                     status = getattr(response, "status", response.getcode())
-                    if 200 <= status < 300:
-                        return True
-                    raise ValidationError(f"Docker Hub tag lookup returned HTTP {status}")
+                    body = response.read(MAX_TAG_API_RESPONSE_BYTES + 1)
+                    if len(body) > MAX_TAG_API_RESPONSE_BYTES:
+                        raise ValidationError("Docker Hub API response exceeded the size limit")
+                    if status == 404 and allow_404:
+                        return None
+                    if status < 200 or status >= 300:
+                        raise ValidationError(f"Docker Hub API returned HTTP {status}")
+                    try:
+                        return json.loads(body.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ValidationError("Docker Hub API returned invalid JSON") from exc
             except urllib.error.HTTPError as exc:
-                if exc.code == 404:
-                    return False
+                last_status = exc.code
+                if exc.code == 404 and allow_404:
+                    return None
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self._attempts:
                     self._sleep(float(attempt))
                     continue
-                raise ValidationError(f"Docker Hub tag lookup returned HTTP {exc.code}") from exc
+                raise ValidationError(f"Docker Hub API returned HTTP {exc.code}") from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt < self._attempts:
                     self._sleep(float(attempt))
                     continue
-                raise ValidationError("Docker Hub tag lookup did not complete") from exc
-        raise ValidationError("Docker Hub tag lookup did not complete")
+                raise ValidationError("Docker Hub API request did not complete") from exc
+        raise ValidationError(f"Docker Hub API request did not complete (last HTTP {last_status})")
 
-
-def ensure_target_tags_absent(tags: object, existence: TagExistence) -> None:
-    if not isinstance(tags, (tuple, list)) or not tags:
-        raise ValidationError("target image tags must be a non-empty sequence")
-    present: list[str] = []
-    for tag in tags:
+    def tag_exists(self, tag: str) -> bool:
         safe_tag = require_image_tag(tag)
-        if existence.tag_exists(safe_tag):
-            present.append(safe_tag)
-    if present:
-        raise ValidationError(
-            "target image tag already exists; rerun verification or publish a new version "
-            f"instead of overwriting it: {', '.join(present)}"
+        return (
+            self._get_json(
+                f"{self._base_url.rstrip('/')}/{urllib.parse.quote(safe_tag, safe='')}",
+                allow_404=True,
+            )
+            is not None
         )
+
+    def list_tags(self) -> tuple[RegistryTag, ...]:
+        """Return one complete, internally consistent Docker Hub tag catalog."""
+
+        base_url = self._base_url.rstrip("/")
+        collected: dict[str, str] = {}
+        expected_count: int | None = None
+        page = 1
+        while page <= MAX_TAG_PAGES:
+            query = urllib.parse.urlencode({"page_size": str(TAG_PAGE_SIZE), "page": str(page)})
+            document = _require_mapping(
+                self._get_json(f"{base_url}?{query}", allow_404=False),
+                label="Docker Hub tags response",
+            )
+            count = document.get("count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValidationError("Docker Hub tags response contains an invalid count")
+            if expected_count is None:
+                expected_count = count
+            elif count != expected_count:
+                raise ValidationError("Docker Hub tag count changed during pagination")
+            results = document.get("results")
+            if not isinstance(results, list):
+                raise ValidationError("Docker Hub tags response must contain results")
+            for entry in results:
+                record = _parse_registry_tag(entry)
+                if record.tag in collected:
+                    raise ValidationError("Docker Hub tag catalog contains a duplicate tag")
+                collected[record.tag] = record.digest
+            if len(collected) > expected_count:
+                raise ValidationError("Docker Hub tag catalog exceeds its reported count")
+            if len(collected) == expected_count:
+                next_page = document.get("next")
+                if next_page not in (None, ""):
+                    raise ValidationError("Docker Hub tag catalog has inconsistent pagination")
+                return tuple(
+                    RegistryTag(tag=tag, digest=digest) for tag, digest in sorted(collected.items())
+                )
+            if not results:
+                raise ValidationError("Docker Hub tag pagination ended before the reported count")
+            page += 1
+        raise ValidationError("Docker Hub tag pagination exceeded the safe page limit")
+
+
+def _parse_registry_tag(value: object) -> RegistryTag:
+    mapping = _require_mapping(value, label="Docker Hub tag")
+    tag = require_image_tag(_require_text(mapping.get("name"), label="Docker Hub tag name"))
+    digest = require_digest(mapping.get("digest"), label=f"Docker Hub tag {tag} digest")
+    return RegistryTag(tag=tag, digest=digest)
+
+
+def _validate_alias_image_identity(
+    *,
+    alias: str,
+    digest: str,
+    expected_version: SemVer,
+    matching_sha_tags: list[str],
+    registry: image_registry.Registry,
+) -> None:
+    """Bind an existing alias digest to its prior OCI image labels.
+
+    A catalog digest shared by a stable tag and a ``sha-*`` tag is only a naming
+    convention. The actual image must report the same stable version and a full
+    revision whose first 12 characters are that ``sha-*`` tag, on both supported
+    platforms, before the alias may move forward.
+    """
+
+    if not callable(getattr(registry, "get_manifest", None)) or not callable(
+        getattr(registry, "get_blob", None)
+    ):
+        raise ValidationError("registry image reader must expose manifest and blob reads")
+    try:
+        resolved_digest, images = image_registry.resolve_platform_image_identities(registry, alias)
+    except image_registry.RegistryError as exc:
+        raise ValidationError(
+            f"Docker Hub could not resolve the OCI identity for mutable alias {alias}"
+        ) from exc
+    if resolved_digest != digest:
+        raise ValidationError(
+            f"mutable alias {alias} resolved to {resolved_digest}, not its catalog digest {digest}"
+        )
+    if set(images) != {"linux/amd64", "linux/arm64"}:
+        raise ValidationError(
+            f"mutable alias {alias} must expose exactly linux/amd64 and linux/arm64"
+        )
+    identities: set[tuple[str, str, str]] = set()
+    for platform in sorted(images):
+        image = images[platform]
+        labels = image.labels
+        source = labels.get("org.opencontainers.image.source")
+        if source != CANONICAL_SOURCE_URL:
+            raise ValidationError(
+                f"mutable alias {alias} {platform} image does not report the canonical source"
+            )
+        version = labels.get("org.opencontainers.image.version")
+        if version != expected_version.version:
+            raise ValidationError(
+                f"mutable alias {alias} {platform} image version {version!r} does not "
+                f"match its highest stable tag {expected_version.version}"
+            )
+        revision = require_full_sha(
+            labels.get("org.opencontainers.image.revision"),
+            label=f"mutable alias {alias} {platform} revision",
+        )
+        if f"sha-{revision[:12]}" not in matching_sha_tags:
+            raise ValidationError(
+                f"mutable alias {alias} {platform} image revision does not match a "
+                "sha-* tag sharing its digest"
+            )
+        identities.add((source, version, revision))
+    if len(identities) != 1:
+        raise ValidationError(
+            f"mutable alias {alias} platform images disagree about source, version, or revision"
+        )
+
+
+def validate_registry_tag_policy(
+    metadata: ReleaseMetadata, tags: object, registry: image_registry.Registry
+) -> None:
+    """Fail closed unless tags are immutable and aliases are verified forward-only."""
+
+    if not isinstance(metadata, ReleaseMetadata):
+        raise ValidationError("release metadata must be derived before registry validation")
+    if not isinstance(tags, (tuple, list)):
+        raise ValidationError("Docker Hub tag catalog must be a sequence")
+    catalog: dict[str, str] = {}
+    for record in tags:
+        if not isinstance(record, RegistryTag):
+            raise ValidationError("Docker Hub tag catalog contains an invalid record")
+        tag = require_image_tag(record.tag)
+        if tag in catalog:
+            raise ValidationError("Docker Hub tag catalog contains a duplicate tag")
+        catalog[tag] = require_digest(record.digest, label=f"Docker Hub tag {tag} digest")
+
+    existing_immutable = [tag for tag in metadata.immutable_image_tags if tag in catalog]
+    if existing_immutable:
+        raise ValidationError(
+            "immutable release tag already exists; publish a new version instead of "
+            f"overwriting it: {', '.join(existing_immutable)}"
+        )
+
+    candidate = parse_published_version_tag(metadata.version)
+    stable: dict[SemVer, str] = {}
+    for tag, digest in catalog.items():
+        if PUBLISHED_VERSION_TAG_PATTERN.fullmatch(tag):
+            stable[parse_published_version_tag(tag)] = digest
+        elif (
+            PUBLISHED_SHA_TAG_PATTERN.fullmatch(tag)
+            or tag == LATEST_TAG
+            or PUBLISHED_MINOR_TAG_PATTERN.fullmatch(tag)
+        ):
+            continue
+        else:
+            raise ValidationError(f"Docker Hub tag is not part of the release policy: {tag}")
+
+    if stable:
+        highest_published = max(stable)
+        if candidate <= highest_published:
+            raise ValidationError(
+                f"candidate version {candidate.version} must be higher than the highest "
+                f"published stable version {highest_published.version}"
+            )
+
+    alias_digests: dict[str, str] = {}
+    for alias in metadata.mutable_image_tags:
+        if alias not in catalog:
+            continue
+        digest = catalog[alias]
+        matching_versions = [
+            version for version, version_digest in stable.items() if version_digest == digest
+        ]
+        if not matching_versions:
+            raise ValidationError(
+                f"mutable alias {alias} points to a digest without an immutable "
+                "semantic-version identity"
+            )
+        matching_sha_tags = [
+            tag
+            for tag, tag_digest in catalog.items()
+            if tag_digest == digest and PUBLISHED_SHA_TAG_PATTERN.fullmatch(tag)
+        ]
+        if not matching_sha_tags:
+            raise ValidationError(
+                f"mutable alias {alias} points to a digest without an immutable sha-* identity"
+            )
+        highest_matching = max(matching_versions)
+        if alias == metadata.minor_version:
+            if (
+                highest_matching.major != candidate.major
+                or highest_matching.minor != candidate.minor
+            ):
+                raise ValidationError(
+                    f"minor alias {alias} must point to a stable release with the same "
+                    f"major/minor version, not {highest_matching.version}"
+                )
+            scope_versions = [
+                version
+                for version in stable
+                if version.major == candidate.major and version.minor == candidate.minor
+            ]
+        else:
+            scope_versions = list(stable)
+        highest_in_scope = max(scope_versions)
+        if highest_in_scope != highest_matching:
+            raise ValidationError(
+                f"mutable alias {alias} points to {highest_matching.version}, but the "
+                f"highest published stable version for its scope is {highest_in_scope.version}; "
+                "refusing a non-highest or rollback alias"
+            )
+        _validate_alias_image_identity(
+            alias=alias,
+            digest=digest,
+            expected_version=highest_matching,
+            matching_sha_tags=matching_sha_tags,
+            registry=registry,
+        )
+        alias_digests[alias] = digest
+
+    if len(alias_digests) == 2 and len(set(alias_digests.values())) != 1:
+        raise ValidationError("mutable aliases disagree about the current release digest")
 
 
 def _load_event(path: object) -> Mapping[str, Any]:
@@ -565,6 +827,7 @@ def _write_resolution_outputs(
     *,
     tag: str,
     sha: str,
+    default_branch_sha: str,
     ci_run_id: int,
 ) -> None:
     semver = parse_stable_tag(tag)
@@ -573,6 +836,9 @@ def _write_resolution_outputs(
         {
             "release_tag": tag,
             "release_sha": require_full_sha(sha),
+            "default_branch_sha": require_full_sha(
+                default_branch_sha, label="default branch commit"
+            ),
             "release_version": semver.version,
             "minor_tag": semver.minor_version,
             "latest_tag": LATEST_TAG,
@@ -605,6 +871,11 @@ def _hub_from_environment(environ: Mapping[str, str]) -> DockerHubTags:
     return DockerHubTags()
 
 
+def _image_registry_from_environment(environ: Mapping[str, str]) -> image_registry.Registry:
+    del environ
+    return image_registry.RegistryClient()
+
+
 def _resolve(
     *,
     repository: str,
@@ -622,20 +893,28 @@ def _resolve(
         remote = resolve_remote_tag(api, tag)
         if remote.commit_sha != event.sha:
             raise ValidationError("tag-push CI SHA and remote peeled tag SHA differ")
-        assert_default_branch_reachability(api, remote.commit_sha)
+        default_branch_sha = assert_default_branch_reachability(api, remote.commit_sha)
         sha = remote.commit_sha
         ci_run_id = event.ci_run_id
     elif event_name == EVENT_WORKFLOW_DISPATCH:
         manual = parse_manual_event(payload, repository=repository, ref=ref, environ=environ)
         tag = manual.tag
         remote = resolve_remote_tag(api, tag)
-        assert_default_branch_reachability(api, remote.commit_sha)
+        default_branch_sha = assert_default_branch_reachability(api, remote.commit_sha)
         run = find_successful_tag_ci(api, tag=tag, sha=remote.commit_sha)
-        ci_run_id = _require_positive_int(run.get("id"), label="CI run id")
+        ci_run_id = _require_positive_int(
+            run.get("id"), label="CI run id", max_value=MAX_GITHUB_OBJECT_ID
+        )
         sha = remote.commit_sha
     else:
         raise ValidationError("only workflow_run and workflow_dispatch are supported")
-    _write_resolution_outputs(output_path, tag=tag, sha=sha, ci_run_id=ci_run_id)
+    _write_resolution_outputs(
+        output_path,
+        tag=tag,
+        sha=sha,
+        default_branch_sha=default_branch_sha,
+        ci_run_id=ci_run_id,
+    )
     return ReleaseEvent(mode=event_name, tag=tag, sha=sha, ci_run_id=ci_run_id)
 
 
@@ -661,13 +940,14 @@ def _pre_push_command(
     release_sha: str,
     checkout: object,
     api: JsonApi,
-    existence: TagExistence,
+    catalog: RegistryTagCatalog,
+    registry: image_registry.Registry,
 ) -> ReleaseMetadata:
     remote = resolve_remote_tag(api, release_tag)
     if remote.commit_sha != require_full_sha(release_sha):
         raise ValidationError("remote peeled tag SHA changed before registry login")
     metadata = verify_release_checkout(checkout, expected_tag=release_tag, expected_sha=release_sha)
-    ensure_target_tags_absent(metadata.image_tags, existence)
+    validate_registry_tag_policy(metadata, catalog.list_tags(), registry)
     return metadata
 
 
@@ -696,7 +976,8 @@ def _build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
     checkout.add_argument("--release-sha", required=True)
 
     pre_push = subparsers.add_parser(
-        "pre-push", help="re-resolve the tag and reject existing image tags"
+        "pre-push",
+        help="re-resolve the tag and enforce immutable-tag and forward-only alias policy",
     )
     add_common(pre_push)
     pre_push.add_argument("--checkout", required=True)
@@ -710,7 +991,10 @@ def main(
     *,
     environ: Mapping[str, str] | None = None,
     api_factory: Callable[[Mapping[str, str]], JsonApi] = _api_from_environment,
-    hub_factory: Callable[[Mapping[str, str]], TagExistence] = _hub_from_environment,
+    hub_factory: Callable[[Mapping[str, str]], RegistryTagCatalog] = _hub_from_environment,
+    image_registry_factory: Callable[
+        [Mapping[str, str]], image_registry.Registry
+    ] = _image_registry_from_environment,
 ) -> int:
     environment = os.environ if environ is None else environ
     arguments = _build_parser(environment).parse_args(argv)
@@ -748,10 +1032,12 @@ def main(
                 release_sha=arguments.release_sha,
                 checkout=arguments.checkout,
                 api=api_factory(environment),
-                existence=hub_factory(environment),
+                catalog=hub_factory(environment),
+                registry=image_registry_factory(environment),
             )
             print(
-                f"Pre-push validation passed for {metadata.tag}; no target Docker Hub tag exists."
+                f"Pre-push validation passed for {metadata.tag}; immutable tags are absent "
+                "and mutable aliases are absent or bound to a verified forward-only image."
             )
             return 0
         raise ValidationError("unknown command")

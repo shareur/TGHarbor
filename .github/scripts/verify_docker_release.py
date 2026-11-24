@@ -62,6 +62,12 @@ MANIFEST_MEDIA_TYPES = frozenset(
         "application/vnd.docker.distribution.manifest.v2+json",
     }
 )
+CONFIG_MEDIA_TYPES = frozenset(
+    {
+        "application/vnd.oci.image.config.v1+json",
+        "application/vnd.docker.container.image.v1+json",
+    }
+)
 ATTESTATION_TYPE_ANNOTATION = "vnd.docker.reference.type"
 ATTESTATION_DIGEST_ANNOTATION = "vnd.docker.reference.digest"
 ATTESTATION_MANIFEST_TYPE = "attestation-manifest"
@@ -149,6 +155,16 @@ class PlatformImage:
     os: str
     labels: Mapping[str, str]
     history: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class PlatformImageIdentity:
+    """Validated platform manifest and label identity for an existing image."""
+
+    platform: str
+    digest: str
+    config_digest: str
+    labels: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -545,6 +561,12 @@ def _inspect_layer_member(
             f"runtime layer {layer_digest} member {normalized}: FIFO member is not allowed"
         )
     if member.issym() or member.islnk():
+        member_reason = _forbidden_layer_path_reason(normalized, policy)
+        if member_reason is not None:
+            raise VerificationError(
+                f"runtime layer {layer_digest} member {normalized}: "
+                f"link member path is forbidden: {member_reason}"
+            )
         resolved, link_reason = _resolve_layer_link_target(
             normalized, member.linkname, hardlink=member.islnk()
         )
@@ -641,6 +663,78 @@ def _get_exact_manifest(registry: Registry, digest: str) -> RegistryManifest:
     return manifest
 
 
+def _require_optional_size(value: object, *, label: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise VerificationError(f"{label} must be a non-negative integer")
+    return value
+
+
+def resolve_platform_image_identities(
+    registry: Registry, reference: str
+) -> tuple[str, Mapping[str, PlatformImageIdentity]]:
+    """Resolve an index and validate both supported platform identity labels.
+
+    This reader is intentionally narrower than full release verification: it
+    proves the index shape, platform manifest media types, config digest and
+    body binding, and label payloads without fetching runtime layers.
+    """
+
+    if not isinstance(reference, str) or not reference:
+        raise VerificationError("image reference must be a non-empty string")
+    index_manifest = registry.get_manifest(reference)
+    index = parse_json_document(index_manifest.body, label="OCI release index")
+    runtime_descriptors, _attestations = classify_index(index)
+    identities: dict[str, PlatformImageIdentity] = {}
+    for descriptor in runtime_descriptors.values():
+        digest = require_digest(descriptor.get("digest"), label="platform manifest digest")
+        manifest = _get_exact_manifest(registry, digest)
+        computed_manifest_digest = f"sha256:{hashlib.sha256(manifest.body).hexdigest()}"
+        if computed_manifest_digest != digest:
+            raise VerificationError("platform manifest digest does not match its content")
+        document = parse_json_document(manifest.body, label="platform manifest")
+        if document.get("mediaType") not in MANIFEST_MEDIA_TYPES:
+            raise VerificationError("platform manifest has an unsupported media type")
+        config = _require_mapping(document.get("config"), label="platform config descriptor")
+        config_media_type = _require_text(
+            config.get("mediaType"), label="platform config media type"
+        )
+        if config_media_type not in CONFIG_MEDIA_TYPES:
+            raise VerificationError("platform config has an unsupported media type")
+        config_digest = require_digest(config.get("digest"), label="platform config digest")
+        config_body = registry.get_blob(config_digest)
+        computed_config_digest = f"sha256:{hashlib.sha256(config_body).hexdigest()}"
+        if computed_config_digest != config_digest:
+            raise VerificationError("platform config digest does not match its content")
+        config_size = _require_optional_size(config.get("size"), label="platform config size")
+        if config_size is not None and config_size != len(config_body):
+            raise VerificationError("platform config size does not match its content")
+        config_document = parse_json_document(config_body, label="platform config")
+        platform = _require_mapping(descriptor.get("platform"), label="platform descriptor")
+        os_name = _require_text(config_document.get("os"), label="config os")
+        config_architecture = _require_text(
+            config_document.get("architecture"), label="config architecture"
+        )
+        if os_name != platform.get("os") or config_architecture != platform.get("architecture"):
+            raise VerificationError("platform config architecture/os does not match its descriptor")
+        config_section = _require_mapping(config_document.get("config"), label="config section")
+        labels = _require_mapping(config_section.get("Labels") or {}, label="config labels")
+        if not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in labels.items()
+        ):
+            raise VerificationError("config labels must map strings to strings")
+        identities[f"{os_name}/{config_architecture}"] = PlatformImageIdentity(
+            platform=f"{os_name}/{config_architecture}",
+            digest=digest,
+            config_digest=config_digest,
+            labels={str(key): str(value) for key, value in labels.items()},
+        )
+    if set(identities) != set(RUNTIME_PLATFORMS):
+        raise VerificationError("image index does not expose both required platforms")
+    return index_manifest.digest, identities
+
+
 def _parse_platform_image(
     registry: Registry,
     descriptor: Mapping[str, Any],
@@ -684,19 +778,6 @@ def _parse_platform_image(
     )
 
 
-def _iter_strings(value: object) -> list[str]:
-    strings: list[str] = []
-    if isinstance(value, str):
-        strings.append(value)
-    elif isinstance(value, Mapping):
-        for nested in value.values():
-            strings.extend(_iter_strings(nested))
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            strings.extend(_iter_strings(nested))
-    return strings
-
-
 def statement_binds_subject(statement: Mapping[str, Any], subject_digest: str) -> bool:
     subjects = statement.get("subject")
     if not isinstance(subjects, list):
@@ -713,16 +794,61 @@ def statement_binds_subject(statement: Mapping[str, Any], subject_digest: str) -
     return False
 
 
+def _provenance_source_identity(
+    statement: Mapping[str, Any], metadata: ReleaseMetadata
+) -> tuple[str, str] | None:
+    """Return the exact BuildKit source URI and commit bound by provenance.
+
+    BuildKit SLSA v1 provenance normally emits the source under
+    ``predicate.buildDefinition.externalParameters.source``. The alternate typed
+    ``predicate.buildDefinition.externalParameters.config.source`` path is
+    accepted only for fail-closed compatibility. Either way the URI and ``sha1``
+    must be reachable only through that typed structure, a statement carrying
+    both paths is rejected, and unrelated build arguments or nested strings
+    cannot satisfy the binding.
+    """
+
+    predicate_type = statement.get("predicateType")
+    if not isinstance(predicate_type, str) or not predicate_type.startswith(PROVENANCE_PREFIX):
+        return None
+    predicate = statement.get("predicate")
+    if not isinstance(predicate, Mapping):
+        return None
+    build_definition = predicate.get("buildDefinition")
+    if not isinstance(build_definition, Mapping):
+        return None
+    external = build_definition.get("externalParameters")
+    if not isinstance(external, Mapping):
+        return None
+    candidates: list[Any] = []
+    direct = external.get("source")
+    if direct is not None:
+        candidates.append(direct)
+    config = external.get("config")
+    if isinstance(config, Mapping) and config.get("source") is not None:
+        candidates.append(config["source"])
+    if len(candidates) != 1:
+        return None
+    source = candidates[0]
+    if not isinstance(source, Mapping):
+        return None
+    uri = source.get("uri")
+    digest = source.get("digest")
+    if not isinstance(uri, str) or CANONICAL_SOURCE_PATTERN.fullmatch(uri) is None:
+        return None
+    if not isinstance(digest, Mapping):
+        return None
+    sha1 = digest.get("sha1")
+    if not isinstance(sha1, str) or sha1 != metadata.sha:
+        return None
+    return uri, sha1
+
+
 def provenance_binds_source_and_revision(
     statement: Mapping[str, Any], metadata: ReleaseMetadata
 ) -> bool:
-    predicate = statement.get("predicate")
-    if not isinstance(predicate, Mapping):
-        return False
-    values = _iter_strings(predicate)
-    has_source = any(CANONICAL_SOURCE_PATTERN.fullmatch(value) for value in values)
-    has_revision = any(value == metadata.sha for value in values)
-    return has_source and has_revision
+    identity = _provenance_source_identity(statement, metadata)
+    return identity is not None
 
 
 def _parse_attestation_statements(

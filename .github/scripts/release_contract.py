@@ -29,6 +29,9 @@ DOCKER_HUB_REGISTRY = "https://registry-1.docker.io"
 DOCKER_HUB_AUTH = "https://auth.docker.io/token"
 
 STABLE_TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+PUBLISHED_VERSION_TAG_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+PUBLISHED_MINOR_TAG_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+PUBLISHED_SHA_TAG_PATTERN = re.compile(r"sha-[0-9a-f]{12}")
 FULL_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 OUTPUT_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -39,7 +42,7 @@ class ContractError(ValueError):
     """Raised when a release input violates a security contract."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class SemVer:
     """A strict stable major.minor.patch release selected by a ``v`` tag."""
 
@@ -72,11 +75,28 @@ class ReleaseMetadata:
         return f"sha-{self.sha[:12]}"
 
     @property
+    def immutable_image_tags(self) -> tuple[str, str]:
+        """Exact identities that must never already exist before publication."""
+
+        return (self.version, self.sha_tag)
+
+    @property
+    def mutable_image_tags(self) -> tuple[str, str]:
+        """Aliases that may move only forward from a verified release."""
+
+        return (self.minor_version, LATEST_TAG)
+
+    @property
     def image_tags(self) -> tuple[str, str, str, str]:
         return (self.version, self.minor_version, LATEST_TAG, self.sha_tag)
 
     def image_references(self, image: str = CANONICAL_IMAGE) -> tuple[str, ...]:
         return tuple(f"{image}:{tag}" for tag in self.image_tags)
+
+
+def _semver_from_match(match: re.Match[str]) -> SemVer:
+    major, minor, patch = (int(component) for component in match.groups())
+    return SemVer(major=major, minor=minor, patch=patch)
 
 
 def parse_stable_tag(value: object) -> SemVer:
@@ -87,8 +107,18 @@ def parse_stable_tag(value: object) -> SemVer:
     match = STABLE_TAG_PATTERN.fullmatch(value)
     if match is None:
         raise ContractError("release tag must be a stable annotated tag in vMAJOR.MINOR.PATCH form")
-    major, minor, patch = (int(component) for component in match.groups())
-    return SemVer(major=major, minor=minor, patch=patch)
+    return _semver_from_match(match)
+
+
+def parse_published_version_tag(value: object) -> SemVer:
+    """Accept only a canonical published image version tag ``MAJOR.MINOR.PATCH``."""
+
+    if not isinstance(value, str):
+        raise ContractError("published image tag must be a string")
+    match = PUBLISHED_VERSION_TAG_PATTERN.fullmatch(value)
+    if match is None:
+        raise ContractError("published image tag must be a canonical MAJOR.MINOR.PATCH version")
+    return _semver_from_match(match)
 
 
 def require_full_sha(value: object, *, label: str = "commit") -> str:

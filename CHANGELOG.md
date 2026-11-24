@@ -67,6 +67,21 @@ rather than preserved.
 - Raise the SQLite busy timeout to 15 seconds for every connection, including
   initialization, to tolerate short writer contention in the default rollback-journal
   mode.
+- Docker release validation now rejects an existing exact version or `sha-<commit>`
+  tag before registry login, requires the candidate to be newer than the highest
+  published stable version even when mutable aliases are absent, and allows the
+  derived minor and `latest` aliases only when they point forward from the highest
+  published stable release for their scope. Each present alias is resolved anonymously
+  and must bind its OCI index, both platform manifests and configs, canonical source
+  label, stable version label, and full revision prefix to a `sha-*` tag sharing the
+  digest; naming alone is insufficient. Registry metadata errors, platform divergence,
+  malformed labels or media types, digest mismatches, rollback targets, and inconsistent
+  pagination fail closed.
+- The release workflow now builds from the validated full commit SHA instead of the
+  mutable tag ref, pins the credential-scoped workflow-source checkout to the exact
+  default-branch SHA resolved by the validation job, and verifies provenance source and
+  revision through the typed BuildKit source fields rather than arbitrary nested
+  strings. Malformed GitHub run number or attempt fields produce a controlled failure.
 
 ### Fixed
 
@@ -94,9 +109,11 @@ rather than preserved.
   batch notifications, pause/continue recovery, persistence diagnostics and log
   hygiene, and the publication, distribution, and release metadata gates.
 - Container images: the `0.2.3` release publishes `0.2.3`, `0.2`, `latest`, and
-  `sha-<commit>` tags for `linux/amd64` and `linux/arm64` from the release tag. Tags
-  remain mutable aliases; the published image digest is the immutable identity. The
-  recorded `0.2.1` image digest remains an immutable historical record.
+  `sha-<commit>` tags for `linux/amd64` and `linux/arm64` from the validated release
+  commit. The exact version and `sha-*` tags are immutable, while the minor and
+  `latest` tags are forward-only aliases whose prior image identity is verified from
+  OCI labels before login. The published image digest remains the immutable identity,
+  and the recorded `0.2.1` image digest remains an immutable historical record.
 
 ## 0.2.2 - 2026-11-13
 

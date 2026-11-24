@@ -69,13 +69,72 @@ security controls.
 
 ## Container identity and provenance
 
-The portable Compose example uses the exact release tag `tgharbor:0.2.3`. Tags remain
-mutable and do not replace a recorded image digest. The Dockerfile provides safe local
+The portable Compose example uses the exact release tag `tgharbor:0.2.3`. Container
+tags are aliases and do not replace a recorded image digest. The release workflow
+treats the exact version and commit tags as immutable identities and only the minor
+and `latest` tags as forward-only mutable aliases. The Dockerfile provides safe local
 defaults: version `0.2.3`, revision `uncommitted`, source `local`, and the Unix epoch
 created timestamp. Those revision, source, and created defaults identify a non-release
 build and are forbidden for a release image.
 
-Build the release image from the clean immutable candidate. Set
+### Registry tag policy
+
+The exact release version (`0.2.3`) and the exact commit identity
+(`sha-<first 12 characters of the commit SHA>`) are immutable. The workflow fails
+closed before registry login, build, or push if either target tag already exists.
+Never overwrite or reuse an immutable version or `sha-*` tag.
+
+The derived minor tag (`0.2`) and `latest` are mutable aliases. Each may be absent. If
+present, an alias may move only forward from a verified older release in the same
+repository. Before registry login, the workflow resolves the complete paginated Docker
+Hub tag catalog and each alias digest. For every present alias it requires that:
+
+- the alias digest is shared by at least one published stable `MAJOR.MINOR.PATCH` tag
+  lower than the candidate version and by at least one immutable `sha-*` tag;
+- the minor alias points to the highest published stable version in the same major and
+  minor series, and the candidate patch is higher;
+- `latest` points to the highest published stable version overall, and the candidate
+  version is higher; and
+- aliases agree on one digest when more than one is present.
+
+The candidate version must also be higher than the highest published stable semantic
+version across the repository, even when both mutable aliases are absent. This global
+monotonic rule prevents an older immutable version from being backfilled after aliases
+have been removed.
+
+A shared digest for a stable tag and a `sha-*` tag is only a naming convention. Before
+login, the workflow therefore anonymously resolves each present alias through the
+registry API and validates its actual OCI identity. Both supported platform images
+(`linux/amd64` and `linux/arm64`) must consistently report the canonical project source,
+the version equal to the highest stable tag sharing the index digest, and one full
+40-character revision whose first 12 characters exactly match a `sha-*` tag sharing that
+digest. Missing or duplicate platforms, divergent platform labels, missing or malformed
+labels or media types, platform-manifest or config digest/body mismatches, oversized
+responses, unsupported index shapes, and registry, authentication, or network errors
+fail closed. A fabricated stable plus `sha-*` naming pair is not accepted without the
+matching image identity.
+
+If several stable tags share the alias digest, the highest matching version is used,
+but the alias must still equal the highest published stable version for its scope. The
+workflow rejects an alias that points to a digest with no stable identity, a digest
+with no `sha-*` identity, an equal or newer version, a non-highest or rollback version,
+a wrong major/minor target for the minor alias, divergent aliases, an unknown or
+malformed tag, duplicate metadata, truncated pagination, or inconsistent counts. Any
+Docker Hub API or registry error is fatal, and the pre-login checks send no
+credentials. The alias policy never writes a stable version or `sha-*` tag.
+
+The pre-login catalog read is not an atomic compare-and-swap. A concurrent registry
+change after validation cannot be prevented by the workflow. The workflow rechecks
+the aliases immediately before registry login, and post-push verification fails closed
+unless all four target tags (`0.2.3`, `0.2`, `latest`, and `sha-<first 12>`) resolve
+to the one new OCI index digest with the required OCI labels, provenance, SBOM, and
+runtime smoke result. A failed post-push check blocks the release and requires
+investigation or a new patch release; it never authorizes moving an immutable tag or
+a mutable alias backward.
+
+Build the release image from the clean immutable candidate. The workflow build context
+is the already validated full commit SHA, not the mutable release tag ref; tag
+reachability and the exact CI run are still verified before the build. Set
 `TGHARBOR_IMAGE_SOURCE` to the verified canonical public source URL without hardcoding
 a non-public source URL, and set `TGHARBOR_IMAGE_CREATED` once to the candidate build
 time in RFC 3339 UTC form. The full candidate commit is mandatory:
@@ -95,9 +154,13 @@ docker build --pull \
 
 Inspect the resulting OCI labels and require title `TGHarbor`, version `0.2.3`, the
 exact candidate commit as revision, the verified public source, license `Apache-2.0`,
-and the supplied created timestamp. Record the image digest with the label values,
-then run the final-filesystem, configuration/history, and per-layer scans. Rebuild the
-release image from the immutable candidate rather than relying on the mutable tag. An
+and the supplied created timestamp. Post-push provenance must structurally bind the
+BuildKit source URI and its `sha1` commit to the canonical source and release revision;
+source or revision strings that appear only in build arguments, internal parameters, or
+other unrelated fields do not satisfy the check. Record the image digest with the label
+values, then run the final-filesystem, configuration/history, and per-layer scans.
+Rebuild the release image from the immutable candidate rather than relying on the
+mutable tag. An
 actual container build remains unpassed when Docker is unavailable; static Dockerfile
 tests do not replace this candidate gate. Completing this source/container release
 gate does not authorize a production rollout, which requires its own recovery and
@@ -110,7 +173,10 @@ with all repository users and rescan every ref afterward.
 ## Continuous controls
 
 CI has read-only repository permissions, checks out complete history, pins Actions to
-immutable commit SHAs, runs dependency auditing, and scans secrets. It also runs
+immutable commit SHAs, runs dependency auditing, and scans secrets. The credential-free
+validation job may start from the protected default branch, but it resolves and outputs
+that branch's exact commit SHA; the credential-scoped publish job checks out its
+workflow source at that exact SHA rather than mutable `master`. CI also runs
 `.github/scripts/verify_publication_boundary.py`, which fails the build on an unsafe
 tracked or reachable-history path, a public link that targets restricted or untracked
 material, a symbolic link in a public document or workflow, an artifact upload without
